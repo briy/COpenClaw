@@ -120,14 +120,18 @@ def write_mcp_config(
         }
 
     # Merge user-installed MCP servers from ~/.copilot/mcp-config.json
-    # so that workers/supervisors have access to the same tools as the brain
-    try:
-        user_servers = get_user_servers_for_merge()
-        if user_servers:
-            config["mcpServers"].update(user_servers)
-            logger.debug("Merged %d user MCP servers into task config", len(user_servers))
-    except Exception:  # noqa: BLE001
-        logger.debug("Could not merge user MCP servers (non-fatal)", exc_info=True)
+    # so that workers/supervisors have access to the same tools as the brain.
+    # Skip if COPENCLAW_SKIP_USER_MCPS is set (reduces API payload size).
+    if not os.environ.get("COPENCLAW_SKIP_USER_MCPS"):
+        try:
+            user_servers = get_user_servers_for_merge()
+            if user_servers:
+                config["mcpServers"].update(user_servers)
+                logger.debug("Merged %d user MCP servers into task config", len(user_servers))
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not merge user MCP servers (non-fatal)", exc_info=True)
+    else:
+        logger.info("Skipping user MCP server merge (COPENCLAW_SKIP_USER_MCPS is set)")
 
     config_path = os.path.join(target_dir, filename)
     with open(config_path, "w", encoding="utf-8") as f:
@@ -426,6 +430,44 @@ class CopilotCli:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to discover non-task session ID: %s", exc)
         return None
+
+    def get_session_size_kb(self, session_id: Optional[str] = None) -> int:
+        """Return the size in KB of a CLI session directory on disk."""
+        sid = session_id or self._resume_session_id
+        if not sid:
+            return 0
+        config_dir = os.path.expanduser("~/.copilot")
+        session_dir = os.path.join(config_dir, "session-state", sid)
+        if not os.path.isdir(session_dir):
+            return 0
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(session_dir):
+            for f in filenames:
+                total += os.path.getsize(os.path.join(dirpath, f))
+        return total // 1024
+
+    def kill_session(self, session_id: Optional[str] = None) -> bool:
+        """Delete a CLI session directory from disk. Returns True if deleted."""
+        import shutil
+
+        sid = session_id or self._resume_session_id
+        if not sid:
+            return False
+        config_dir = os.path.expanduser("~/.copilot")
+        session_dir = os.path.join(config_dir, "session-state", sid)
+        if not os.path.isdir(session_dir):
+            return False
+        try:
+            shutil.rmtree(session_dir)
+            logger.info("Killed CLI session %s (%s)", sid, session_dir)
+            if self._resume_session_id == sid:
+                self._resume_session_id = None
+            if self._session_id == sid:
+                self._session_id = None
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to kill session %s: %s", sid, exc)
+            return False
 
     # ── public API ────────────────────────────────────────────
 

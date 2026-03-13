@@ -1839,6 +1839,59 @@ def create_app() -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Watchdog loop error: %s", exc)
 
+            # ── Orchestrator session size check ──
+            try:
+                max_kb = getattr(settings, "session_max_size_kb", 500)
+                if max_kb > 0 and cli.resume_session_id:
+                    size_kb = cli.get_session_size_kb()
+                    if size_kb > max_kb:
+                        logger.warning(
+                            "Orchestrator session %s is %d KB (limit %d KB); rotating...",
+                            cli.resume_session_id, size_kb, max_kb,
+                        )
+                        _rotate_orchestrator_session(f"size {size_kb}KB > {max_kb}KB limit")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Watchdog session size check error: %s", exc)
+
+    # ---- session rotation (no app restart) ----
+
+    def _rotate_orchestrator_session(reason: str = "manual") -> Optional[str]:
+        """Kill the current orchestrator CLI session and bootstrap a fresh one.
+
+        Returns the new session ID, or None on failure.
+        """
+        old_sid = cli.resume_session_id
+        logger.warning("SESSION ROTATION initiated: %s (old session: %s)", reason, old_sid)
+        log_event(settings.data_dir, "session.rotate", {"reason": reason, "old_session_id": old_sid})
+
+        # 1. Kill the old session on disk
+        if old_sid:
+            cli.kill_session(old_sid)
+
+        # 2. Clear all per-user stored session IDs
+        try:
+            sessions.clear_all_copilot_session_ids()
+        except AttributeError:
+            # SessionStore may not have this method yet; clear individually
+            for key in list(getattr(sessions, "_data", {}).keys()):
+                sessions.clear_copilot_session_id(key)
+
+        # 3. Bootstrap a fresh session
+        workspace = settings.workspace_dir or os.getcwd()
+        readme_context = _read_readme(workspace)
+        try:
+            cli.create_session(context=readme_context)
+            new_sid = cli._discover_latest_non_task_session_id()
+            if new_sid:
+                cli._resume_session_id = new_sid
+                cli._session_id = new_sid
+                logger.info("Session rotation complete. New session: %s", new_sid)
+                return new_sid
+            logger.warning("Session rotation: new session created but ID not discovered")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Session rotation bootstrap failed: %s", exc)
+        return None
+
     # ---- restart mechanism ----
 
     def _restart_app(reason: str = "manual") -> None:

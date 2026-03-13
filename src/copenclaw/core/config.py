@@ -43,6 +43,7 @@ class Settings:
     port: int
     backup_max_snapshots: int
     clear_logs_on_launch: bool
+    session_max_size_kb: int
 
     @staticmethod
     def from_env() -> "Settings":
@@ -92,4 +93,5 @@ class Settings:
             port=int(os.getenv("copenclaw_PORT", "18790")),
             backup_max_snapshots=int(os.getenv("copenclaw_BACKUP_MAX_SNAPSHOTS", "30")),
             clear_logs_on_launch=os.getenv("copenclaw_CLEAR_LOGS_ON_LAUNCH", "false").lower() in {"1", "true", "yes"},
+            session_max_size_kb=int(os.getenv("COPENCLAW_SESSION_MAX_SIZE_KB", "500")),
         )
