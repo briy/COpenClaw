@@ -1869,12 +1869,7 @@ def create_app() -> FastAPI:
             cli.kill_session(old_sid)
 
         # 2. Clear all per-user stored session IDs
-        try:
-            sessions.clear_all_copilot_session_ids()
-        except AttributeError:
-            # SessionStore may not have this method yet; clear individually
-            for key in list(getattr(sessions, "_data", {}).keys()):
-                sessions.clear_copilot_session_id(key)
+        sessions.clear_all_copilot_session_ids()
 
         # 3. Bootstrap a fresh session
         workspace = settings.workspace_dir or os.getcwd()

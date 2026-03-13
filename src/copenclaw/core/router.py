@@ -111,6 +111,34 @@ def handle_chat(
             return ChatResponse(text="🔄 Restarting COpenClaw… The app will be back online shortly.")
         return ChatResponse(text="Restart not available — no restart callback configured.")
 
+    if text.startswith("/rotate"):
+        if req.sender_id not in allow_from:
+            return ChatResponse(text="Not authorized", status="denied")
+        reason = text[len("/rotate"):].strip() or "User requested via /rotate"
+        old_sid = cli.resume_session_id
+        size_kb = cli.get_session_size_kb() if old_sid else 0
+        log_event(data_dir, f"{req.channel}.rotate", {
+            "sender_id": req.sender_id, "reason": reason,
+            "old_session_id": old_sid, "old_size_kb": size_kb,
+        }, request_id=rid)
+        # Kill old session and clear routing
+        if old_sid:
+            cli.kill_session(old_sid)
+        sessions.clear_all_copilot_session_ids()
+        cli.resume_session_id = None
+        # Bootstrap fresh session
+        try:
+            cli.create_session()
+            new_sid = cli._discover_latest_non_task_session_id()
+            if new_sid:
+                cli._resume_session_id = new_sid
+                cli._session_id = new_sid
+            return ChatResponse(
+                text=f"✅ Session rotated. Old: {size_kb}KB. Fresh session ready.",
+            )
+        except CopilotCliError as exc:
+            return ChatResponse(text=f"⚠️ Rotation failed during bootstrap: {exc}")
+
     if text.startswith("/update"):
         if req.sender_id not in allow_from and not (owner_id and req.sender_id == owner_id):
             return ChatResponse(text="Not authorized", status="denied")
@@ -408,10 +436,40 @@ def handle_chat(
             on_line=_should_stop_after_proposal_line,
         )
     except CopilotCliError as exc:
+        err_str = str(exc)
+        is_400 = "400" in err_str and "Bad Request" in err_str
+
         # If a previously stored resume session is stale (for example after a
         # crashed Copilot CLI process), clear it and retry once without resume.
         had_resume = bool(copilot_sid or cli.resume_session_id)
-        if had_resume:
+
+        if is_400 and had_resume:
+            # Full rotation: kill the bloated session dir, clear all routing,
+            # bootstrap a fresh session, then retry the prompt.
+            logger.warning(
+                "CAPIError 400 detected for %s — performing full session rotation: %s",
+                session_key, exc,
+            )
+            old_sid = copilot_sid or cli.resume_session_id
+            if old_sid:
+                cli.kill_session(old_sid)
+            sessions.clear_all_copilot_session_ids()
+            cli.resume_session_id = None
+            try:
+                cli.create_session()
+                new_sid = cli._discover_latest_non_task_session_id()
+                if new_sid:
+                    cli._resume_session_id = new_sid
+                    cli._session_id = new_sid
+                output = cli.run_prompt(
+                    prompt_with_reminder,
+                    resume_id=None,
+                    on_line=_should_stop_after_proposal_line,
+                )
+                logger.info("Auto-rotation succeeded; retried prompt on fresh session")
+            except CopilotCliError as retry_exc:
+                output = f"⚠️ Session auto-rotated after 400 error, but retry also failed: {retry_exc}"
+        elif had_resume:
             logger.warning("Copilot CLI resume failed for %s; retrying without resume: %s", session_key, exc)
             if copilot_sid:
                 sessions.clear_copilot_session_id(session_key)

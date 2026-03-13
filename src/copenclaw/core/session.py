@@ -183,3 +183,14 @@ class SessionStore:
         if session and "copilot_session_id" in session.data:
             del session.data["copilot_session_id"]
             self._save()
+
+    def clear_all_copilot_session_ids(self) -> int:
+        """Remove stored Copilot CLI session IDs for all users. Returns count cleared."""
+        cleared = 0
+        for session in self._sessions.values():
+            if "copilot_session_id" in session.data:
+                del session.data["copilot_session_id"]
+                cleared += 1
+        if cleared:
+            self._save()
+        return cleared
