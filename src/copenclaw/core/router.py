@@ -444,23 +444,48 @@ def handle_chat(
         had_resume = bool(copilot_sid or cli.resume_session_id)
 
         if is_400 and had_resume:
-            # Full rotation: kill the bloated session dir, clear all routing,
-            # bootstrap a fresh session, then retry the prompt.
+            # Full rotation: write checkpoint, kill the bloated session dir,
+            # clear all routing, bootstrap a fresh session, then retry the prompt.
             logger.warning(
                 "CAPIError 400 detected for %s — performing full session rotation: %s",
                 session_key, exc,
             )
             old_sid = copilot_sid or cli.resume_session_id
+
+            # Best-effort checkpoint before killing the session
+            try:
+                from copenclaw.core.gateway import _write_orchestrator_checkpoint, _build_recovery_context, _read_readme, _archive_checkpoint
+                _write_orchestrator_checkpoint(
+                    data_dir,
+                    reason=f"CAPIError 400 auto-rotation",
+                    task_manager=task_manager,
+                    session_id=old_sid,
+                    extra={"trigger": "router_400", "user_message_preview": text[:200]},
+                )
+            except Exception as chk_exc:  # noqa: BLE001
+                logger.warning("Could not write checkpoint during 400 recovery: %s", chk_exc)
+
             if old_sid:
                 cli.kill_session(old_sid)
             sessions.clear_all_copilot_session_ids()
             cli.resume_session_id = None
             try:
-                cli.create_session()
+                # Build recovery context for the fresh session
+                recovery_ctx = ""
+                try:
+                    recovery_ctx = _build_recovery_context(data_dir)
+                except Exception:  # noqa: BLE001
+                    pass
+                boot_context = recovery_ctx if recovery_ctx else ""
+                cli.create_session(context=boot_context)
                 new_sid = cli._discover_latest_non_task_session_id()
                 if new_sid:
                     cli._resume_session_id = new_sid
                     cli._session_id = new_sid
+                try:
+                    _archive_checkpoint(data_dir)
+                except Exception:  # noqa: BLE001
+                    pass
                 output = cli.run_prompt(
                     prompt_with_reminder,
                     resume_id=None,

@@ -46,6 +46,49 @@ Create your project folder inside `{workspace_root}` (e.g., `{workspace_root}{se
 
 Then `cd` into it and do ALL your work there.
 
+## 🔒 Amnesia Protection: Git Discipline & Progress Tracking
+
+Your session may be killed at any time (session rotation, resource limits, crashes).
+**Uncommitted work is lost forever.** Follow these rules to ensure your progress survives:
+
+### Git: Clone, Commit, Push
+
+1. **Always work from a git repo.** If the task involves an existing repo, `git clone` it
+   into your project folder. If creating something new, `git init` immediately.
+2. **Commit early and often.** After every meaningful milestone (file created, feature working,
+   test passing), make a commit. Do NOT wait until the end.
+3. **Push after every commit.** If you have a remote, push immediately after committing.
+   Unpushed commits are lost if your session dies.
+4. **Use descriptive commit messages.** Future workers (or the orchestrator resuming your
+   work) need to understand what each commit accomplished.
+
+### PLAN.md: Your Resumable Checkpoint
+
+1. **For any non-trivial task, create a `PLAN.md` in the project root** before writing code.
+   This is your checkpoint file — it must be self-contained enough that a different worker
+   (with zero context about your session) can read it and continue your work.
+2. **PLAN.md must include:**
+   - Task objective and acceptance criteria
+   - Step-by-step implementation plan with checkboxes (`- [ ]` / `- [x]`)
+   - Current status: which step you're on, what's done, what's next
+   - Key decisions made and why
+   - File paths and locations of important work
+   - Any blockers or open questions
+3. **Update PLAN.md at every milestone.** Check off completed steps, add notes about what
+   you learned, update the "current status" section. Then **commit and push** the update.
+4. **Update PLAN.md BEFORE long-running commands.** If you're about to run a build, test
+   suite, or install that might take a while, update the plan first so your intent is recorded.
+
+### README.md: Include Recovery Pointers
+
+When updating the workspace README.md (step 6 in "How to Work"), include:
+- **Repo URL** (if cloned from a remote)
+- **Branch name** you were working on
+- **Path to PLAN.md** in the project
+- **Last commit hash** before you finished
+
+This lets the orchestrator (or a new worker) find your work instantly after a rotation.
+
 ## ⚠️ AVOID interactive or blocking commands!
 
 **DO NOT** run commands that wait for user input or run forever:

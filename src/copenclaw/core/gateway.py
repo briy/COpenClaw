@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import glob
+import json
 import logging
 from typing import Any, Optional
 import os
@@ -426,6 +427,131 @@ def _read_readme(workspace_dir: str, max_chars: int = 8000) -> str:
         return content
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _checkpoint_path(data_dir: str) -> str:
+    """Return the path to the orchestrator checkpoint file."""
+    return os.path.join(data_dir, "orchestrator-checkpoint.json")
+
+
+def _write_orchestrator_checkpoint(
+    data_dir: str,
+    reason: str,
+    *,
+    orchestrator_summary: str = "",
+    task_manager: Any = None,
+    session_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Write a checkpoint file so the next session can resume context.
+
+    Returns the checkpoint file path.
+    """
+    checkpoint: dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "previous_session_id": session_id,
+        "orchestrator_summary": orchestrator_summary,
+    }
+
+    # Snapshot active/recent tasks from TaskManager
+    if task_manager is not None:
+        try:
+            tasks_snapshot = []
+            for t in task_manager.list_tasks():
+                tasks_snapshot.append({
+                    "task_id": t.task_id,
+                    "name": t.name,
+                    "status": t.status,
+                    "prompt_preview": t.prompt[:500] if t.prompt else "",
+                    "plan": t.plan or "",
+                    "working_dir": t.working_dir or "",
+                    "timeline_tail": [
+                        {"event": e.event, "summary": e.summary, "ts": e.ts.isoformat() if hasattr(e.ts, "isoformat") else str(e.ts)}
+                        for e in (t.timeline or [])[-5:]
+                    ],
+                })
+            checkpoint["tasks"] = tasks_snapshot
+        except Exception as exc:  # noqa: BLE001
+            checkpoint["tasks_error"] = str(exc)
+
+    if extra:
+        checkpoint["extra"] = extra
+
+    path = _checkpoint_path(data_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(checkpoint, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    logger.info("Orchestrator checkpoint written: %s (%d bytes)", path, os.path.getsize(path))
+    return path
+
+
+def _read_orchestrator_checkpoint(data_dir: str) -> dict[str, Any] | None:
+    """Read the orchestrator checkpoint file, if it exists."""
+    path = _checkpoint_path(data_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to read orchestrator checkpoint: %s", exc)
+        return None
+
+
+def _build_recovery_context(data_dir: str) -> str:
+    """Build a recovery prompt section from the checkpoint file.
+
+    Returns an empty string if no checkpoint exists.
+    """
+    checkpoint = _read_orchestrator_checkpoint(data_dir)
+    if not checkpoint:
+        return ""
+
+    parts = [
+        "⚠️ SESSION RECOVERY: Your previous session was rotated.",
+        f"Rotation reason: {checkpoint.get('reason', 'unknown')}",
+        f"Rotation time: {checkpoint.get('timestamp', 'unknown')}",
+    ]
+
+    summary = checkpoint.get("orchestrator_summary", "")
+    if summary:
+        parts.append(f"\nYour previous session's state summary:\n{summary}")
+
+    tasks = checkpoint.get("tasks", [])
+    if tasks:
+        parts.append("\nTask status at rotation time:")
+        for t in tasks:
+            status_line = f"  - [{t['status']}] {t['name']} ({t['task_id']})"
+            if t.get("plan"):
+                status_line += f"\n    Plan: {t['plan'][:200]}"
+            timeline = t.get("timeline_tail", [])
+            if timeline:
+                last = timeline[-1]
+                status_line += f"\n    Last event: {last.get('event', '?')} — {last.get('summary', '?')}"
+            parts.append(status_line)
+
+    parts.append(
+        "\nPlease acknowledge the rotation to the user and check on any active tasks. "
+        "Read PLAN.md files in project folders for detailed worker progress."
+    )
+    return "\n".join(parts)
+
+
+def _archive_checkpoint(data_dir: str) -> None:
+    """Rename the checkpoint file to .archived so it's not read again on next boot."""
+    path = _checkpoint_path(data_dir)
+    if os.path.isfile(path):
+        archive = path + f".archived.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+        try:
+            os.rename(path, archive)
+            logger.info("Checkpoint archived: %s", archive)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to archive checkpoint: %s", exc)
 
 
 def _resolve_repo_root() -> str:
@@ -906,6 +1032,12 @@ def create_app() -> FastAPI:
         _seed_readme(workspace)
         readme_context = _read_readme(workspace)
 
+        # Check for recovery checkpoint from a previous rotation
+        recovery_context = _build_recovery_context(settings.data_dir)
+        if recovery_context:
+            logger.info("Recovery checkpoint found — including in boot prompt")
+            readme_context = readme_context + "\n\n" + recovery_context if readme_context else recovery_context
+
         try:
             logger.info("Bootstrapping Copilot CLI brain session...")
             response = cli.create_session(context=readme_context)
@@ -918,6 +1050,12 @@ def create_app() -> FastAPI:
                 cli._resume_session_id = boot_sid
                 cli._session_id = boot_sid
                 logger.info("Brain session ready. Captured boot session ID: %s", boot_sid)
+            else:
+                logger.info("Brain session ready. Session ID: (not discovered)")
+
+            # Archive the checkpoint now that the new brain has consumed it
+            if recovery_context:
+                _archive_checkpoint(settings.data_dir)
             else:
                 logger.info("Brain session ready. Session ID: (not discovered)")
 
@@ -1839,23 +1977,110 @@ def create_app() -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Watchdog loop error: %s", exc)
 
-            # ── Orchestrator session size check ──
+            # ── Orchestrator session size check (yellow & red zones) ──
             try:
                 max_kb = getattr(settings, "session_max_size_kb", 500)
+                yellow_pct = getattr(settings, "session_yellow_zone_pct", 70)
                 if max_kb > 0 and cli.resume_session_id:
                     size_kb = cli.get_session_size_kb()
+                    yellow_kb = int(max_kb * yellow_pct / 100)
+
                     if size_kb > max_kb:
+                        # RED ZONE — must rotate now
                         logger.warning(
-                            "Orchestrator session %s is %d KB (limit %d KB); rotating...",
+                            "RED ZONE: Orchestrator session %s is %d KB (limit %d KB); rotating...",
                             cli.resume_session_id, size_kb, max_kb,
                         )
-                        _rotate_orchestrator_session(f"size {size_kb}KB > {max_kb}KB limit")
+                        _rotate_orchestrator_session(
+                            f"red zone: size {size_kb}KB > {max_kb}KB limit",
+                            attempt_orchestrator_checkpoint=True,
+                        )
+                    elif size_kb > yellow_kb and not getattr(_rotate_orchestrator_session, "_yellow_warned", False):
+                        # YELLOW ZONE — warn, freeze workers, checkpoint
+                        logger.warning(
+                            "YELLOW ZONE: Orchestrator session %s is %d KB (%d%% of %d KB limit)",
+                            cli.resume_session_id, size_kb, int(size_kb * 100 / max_kb), max_kb,
+                        )
+                        _rotate_orchestrator_session._yellow_warned = True  # type: ignore[attr-defined]
+
+                        # 1. Notify user
+                        _notify_owner_message(
+                            settings,
+                            f"⚠️ Session approaching size limit ({size_kb}KB / {max_kb}KB). "
+                            "Saving state and preparing for rotation. Active workers are being "
+                            "instructed to commit and push their progress.",
+                        )
+
+                        # 2. Send freeze instructions to active workers
+                        _freeze_active_workers(task_manager)
+
+                        # 3. Write orchestrator checkpoint (best-effort, no LLM summary)
+                        _write_orchestrator_checkpoint(
+                            settings.data_dir,
+                            reason=f"yellow zone: {size_kb}KB / {max_kb}KB",
+                            task_manager=task_manager,
+                            session_id=cli.resume_session_id,
+                        )
+                    elif size_kb <= yellow_kb:
+                        # Below yellow — reset warning flag
+                        _rotate_orchestrator_session._yellow_warned = False  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001
                 logger.error("Watchdog session size check error: %s", exc)
 
+    # ---- helper: notify owner ----
+
+    def _notify_owner_message(settings: Settings, msg: str) -> None:
+        """Send a notification to the Telegram owner, if configured."""
+        owner_chat_id = settings.telegram_owner_chat_id
+        if not (settings.telegram_bot_token and owner_chat_id):
+            # Fall back to first allowed user
+            if settings.telegram_bot_token and settings.telegram_allow_from:
+                owner_chat_id = settings.telegram_allow_from[0]
+            else:
+                logger.warning("Cannot notify owner: no Telegram config")
+                return
+        try:
+            from copenclaw.integrations.telegram import TelegramAdapter
+            tg = TelegramAdapter(settings.telegram_bot_token)
+            tg.send_message(chat_id=int(owner_chat_id), text=msg)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to notify owner: %s", exc)
+
+    # ---- helper: freeze active workers ----
+
+    def _freeze_active_workers(task_manager: Any) -> None:
+        """Send freeze instructions to all running workers to commit and push."""
+        try:
+            for t in task_manager.list_tasks():
+                if t.status == "running":
+                    task_manager.send_message(
+                        t.task_id,
+                        msg_type="instruction",
+                        content=(
+                            "⚠️ FREEZE: The orchestrator session is approaching size limits and will "
+                            "rotate soon. You must IMMEDIATELY:\n"
+                            "1. Commit all current work with a descriptive message\n"
+                            "2. Push to remote\n"
+                            "3. Update PLAN.md with your current status, what's done, what's next\n"
+                            "4. Commit and push the PLAN.md update\n"
+                            "5. Report progress via task_report(type='progress') with a summary\n"
+                            "Do this NOW before your session ends."
+                        ),
+                        from_tier="system",
+                    )
+                    logger.info("Freeze instruction sent to worker %s", t.task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to freeze workers: %s", exc)
+
     # ---- session rotation (no app restart) ----
 
-    def _rotate_orchestrator_session(reason: str = "manual") -> Optional[str]:
+    _rotate_orchestrator_session._yellow_warned = False  # type: ignore[attr-defined]
+
+    def _rotate_orchestrator_session(
+        reason: str = "manual",
+        *,
+        attempt_orchestrator_checkpoint: bool = False,
+    ) -> Optional[str]:
         """Kill the current orchestrator CLI session and bootstrap a fresh one.
 
         Returns the new session ID, or None on failure.
@@ -1864,16 +2089,54 @@ def create_app() -> FastAPI:
         logger.warning("SESSION ROTATION initiated: %s (old session: %s)", reason, old_sid)
         log_event(settings.data_dir, "session.rotate", {"reason": reason, "old_session_id": old_sid})
 
-        # 1. Kill the old session on disk
+        # 0. Write checkpoint (best-effort from TaskManager state)
+        orchestrator_summary = ""
+        if attempt_orchestrator_checkpoint:
+            # Try to get LLM summary from the orchestrator before killing it
+            try:
+                orchestrator_summary = cli.run_prompt(
+                    "The system is about to rotate your session. Please provide a brief summary of: "
+                    "(1) what the user asked you to do, (2) what tasks are active/pending, "
+                    "(3) any promises you made to the user. Be concise but complete.",
+                    resume_id=old_sid,
+                    log_prefix="CHECKPOINT",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not get orchestrator summary for checkpoint: %s", exc)
+
+        _write_orchestrator_checkpoint(
+            settings.data_dir,
+            reason=reason,
+            orchestrator_summary=orchestrator_summary,
+            task_manager=task_manager,
+            session_id=old_sid,
+        )
+
+        # 1. Notify user
+        _notify_owner_message(
+            settings,
+            f"🔄 Session rotating ({reason}). Your conversation context will be preserved via checkpoint.",
+        )
+
+        # 2. Kill the old session on disk
         if old_sid:
             cli.kill_session(old_sid)
 
-        # 2. Clear all per-user stored session IDs
+        # 3. Clear all per-user stored session IDs
         sessions.clear_all_copilot_session_ids()
 
-        # 3. Bootstrap a fresh session
+        # 4. Reset yellow zone warning
+        _rotate_orchestrator_session._yellow_warned = False  # type: ignore[attr-defined]
+
+        # 5. Bootstrap a fresh session (reads checkpoint automatically via _build_recovery_context)
         workspace = settings.workspace_dir or os.getcwd()
+        _deploy_instructions(workspace)
+        _seed_readme(workspace)
         readme_context = _read_readme(workspace)
+        recovery_context = _build_recovery_context(settings.data_dir)
+        if recovery_context:
+            readme_context = readme_context + "\n\n" + recovery_context if readme_context else recovery_context
+
         try:
             cli.create_session(context=readme_context)
             new_sid = cli._discover_latest_non_task_session_id()
@@ -1881,6 +2144,13 @@ def create_app() -> FastAPI:
                 cli._resume_session_id = new_sid
                 cli._session_id = new_sid
                 logger.info("Session rotation complete. New session: %s", new_sid)
+                _archive_checkpoint(settings.data_dir)
+
+                # Notify user that rotation completed
+                _notify_owner_message(
+                    settings,
+                    "✅ Session rotated successfully. I've loaded the checkpoint and I'm ready to continue.",
+                )
                 return new_sid
             logger.warning("Session rotation: new session created but ID not discovered")
         except Exception as exc:  # noqa: BLE001
