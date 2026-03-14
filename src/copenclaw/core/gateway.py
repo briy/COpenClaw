@@ -414,6 +414,109 @@ def _seed_readme(workspace_dir: str) -> None:
         logger.info("Seeded workspace README.md at %s", readme_path)
 
 
+def _prune_readme_tasks(workspace_dir: str, retention_days: int = 7) -> None:
+    """Remove completed-task rows older than *retention_days* from README.md.
+
+    Parses the ``## Completed Tasks`` markdown table, keeps only rows whose
+    date column falls within the retention window, and rewrites the file.
+    Older entries are already preserved in ``tasks.json``.
+    """
+    readme_path = os.path.join(workspace_dir, "README.md")
+    if not os.path.isfile(readme_path):
+        return
+    try:
+        with open(readme_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:  # noqa: BLE001
+        return
+
+    # Locate the completed-tasks table
+    marker = "## Completed Tasks"
+    idx = content.find(marker)
+    if idx == -1:
+        return
+
+    before = content[: idx + len(marker)]
+    after_marker = content[idx + len(marker) :]
+
+    # Split into lines; first non-empty lines should be the table header + separator
+    lines = after_marker.split("\n")
+    header_lines: list[str] = []
+    data_lines: list[str] = []
+    past_header = False
+    remainder_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        # Detect next section (another ## heading) → stop parsing table
+        if stripped.startswith("## ") and stripped != marker:
+            remainder_lines.append(line)
+            remainder_lines.extend(lines[lines.index(line) + 1 :])
+            break
+        if not past_header:
+            # Header row and separator row (e.g. |---|---|---|)
+            if stripped.startswith("|"):
+                header_lines.append(line)
+                if set(stripped.replace("|", "").replace("-", "").strip()) <= set(" "):
+                    past_header = True
+            elif not stripped:
+                header_lines.append(line)
+            continue
+        # Data rows
+        if stripped.startswith("|"):
+            data_lines.append(line)
+        elif not stripped:
+            data_lines.append(line)
+        else:
+            remainder_lines.append(line)
+            break
+
+    if not data_lines:
+        return  # nothing to prune
+
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=retention_days)
+    kept: list[str] = []
+    pruned_count = 0
+    for line in data_lines:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            kept.append(line)
+            continue
+        # Extract first column (date)
+        cols = [c.strip() for c in stripped.split("|") if c.strip()]
+        if not cols:
+            kept.append(line)
+            continue
+        try:
+            row_date = datetime.strptime(cols[0], "%Y-%m-%d").date()
+            if row_date >= cutoff:
+                kept.append(line)
+            else:
+                pruned_count += 1
+        except ValueError:
+            kept.append(line)  # keep rows with unparseable dates
+
+    if pruned_count == 0:
+        return  # nothing changed
+
+    # Rebuild the file
+    new_content = before + "\n"
+    if header_lines:
+        new_content += "\n".join(header_lines) + "\n"
+    if kept:
+        new_content += "\n".join(kept) + "\n"
+    if remainder_lines:
+        new_content += "\n".join(remainder_lines)
+
+    try:
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        logger.info("Pruned %d old task(s) from README.md (retention=%d days)", pruned_count, retention_days)
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to write pruned README.md")
+
+
 def _read_readme(workspace_dir: str, max_chars: int = 4000) -> str:
     """Read the workspace README.md, returning up to *max_chars*."""
     readme_path = os.path.join(workspace_dir, "README.md")
@@ -1031,8 +1134,9 @@ def create_app() -> FastAPI:
         # Deploy system prompt to workspace so Copilot CLI can find it
         _deploy_instructions(workspace)
 
-        # Seed and read workspace README.md
+        # Seed, prune old tasks, then read workspace README.md
         _seed_readme(workspace)
+        _prune_readme_tasks(workspace, settings.readme_task_retention_days)
         readme_context = _read_readme(workspace)
 
         # Check for recovery checkpoint from a previous rotation
@@ -2133,6 +2237,7 @@ def create_app() -> FastAPI:
         workspace = settings.workspace_dir or os.getcwd()
         _deploy_instructions(workspace)
         _seed_readme(workspace)
+        _prune_readme_tasks(workspace, settings.readme_task_retention_days)
         readme_context = _read_readme(workspace)
         recovery_context = _build_recovery_context(settings.data_dir)
         if recovery_context:

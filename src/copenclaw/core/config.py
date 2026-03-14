@@ -45,6 +45,7 @@ class Settings:
     clear_logs_on_launch: bool
     session_max_size_kb: int
     session_yellow_zone_pct: int
+    readme_task_retention_days: int
 
     @staticmethod
     def from_env() -> "Settings":
@@ -96,4 +97,5 @@ class Settings:
             clear_logs_on_launch=os.getenv("copenclaw_CLEAR_LOGS_ON_LAUNCH", "false").lower() in {"1", "true", "yes"},
             session_max_size_kb=int(os.getenv("COPENCLAW_SESSION_MAX_SIZE_KB", "500")),
             session_yellow_zone_pct=int(os.getenv("COPENCLAW_SESSION_YELLOW_ZONE_PCT", "70")),
+            readme_task_retention_days=int(os.getenv("COPENCLAW_README_TASK_RETENTION_DAYS", "7")),
         )
