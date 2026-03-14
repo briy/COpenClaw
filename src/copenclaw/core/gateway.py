@@ -2074,8 +2074,6 @@ def create_app() -> FastAPI:
 
     # ---- session rotation (no app restart) ----
 
-    _rotate_orchestrator_session._yellow_warned = False  # type: ignore[attr-defined]
-
     def _rotate_orchestrator_session(
         reason: str = "manual",
         *,
@@ -2156,6 +2154,8 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             logger.error("Session rotation bootstrap failed: %s", exc)
         return None
+
+    _rotate_orchestrator_session._yellow_warned = False  # type: ignore[attr-defined]
 
     # ---- restart mechanism ----
 
