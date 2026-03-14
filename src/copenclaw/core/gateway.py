@@ -414,7 +414,7 @@ def _seed_readme(workspace_dir: str) -> None:
         logger.info("Seeded workspace README.md at %s", readme_path)
 
 
-def _read_readme(workspace_dir: str, max_chars: int = 8000) -> str:
+def _read_readme(workspace_dir: str, max_chars: int = 4000) -> str:
     """Read the workspace README.md, returning up to *max_chars*."""
     readme_path = os.path.join(workspace_dir, "README.md")
     if not os.path.isfile(readme_path):
@@ -503,7 +503,7 @@ def _read_orchestrator_checkpoint(data_dir: str) -> dict[str, Any] | None:
         return None
 
 
-def _build_recovery_context(data_dir: str) -> str:
+def _build_recovery_context(data_dir: str, max_chars: int = 4000) -> str:
     """Build a recovery prompt section from the checkpoint file.
 
     Returns an empty string if no checkpoint exists.
@@ -520,7 +520,7 @@ def _build_recovery_context(data_dir: str) -> str:
 
     summary = checkpoint.get("orchestrator_summary", "")
     if summary:
-        parts.append(f"\nYour previous session's state summary:\n{summary}")
+        parts.append(f"\nYour previous session's state summary:\n{summary[:1000]}")
 
     tasks = checkpoint.get("tasks", [])
     if tasks:
@@ -539,7 +539,10 @@ def _build_recovery_context(data_dir: str) -> str:
         "\nPlease acknowledge the rotation to the user and check on any active tasks. "
         "Read PLAN.md files in project folders for detailed worker progress."
     )
-    return "\n".join(parts)
+    result = "\n".join(parts)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n\n… (recovery context truncated)"
+    return result
 
 
 def _archive_checkpoint(data_dir: str) -> None:
