@@ -95,7 +95,7 @@ class Settings:
             port=int(os.getenv("copenclaw_PORT", "18790")),
             backup_max_snapshots=int(os.getenv("copenclaw_BACKUP_MAX_SNAPSHOTS", "30")),
             clear_logs_on_launch=os.getenv("copenclaw_CLEAR_LOGS_ON_LAUNCH", "false").lower() in {"1", "true", "yes"},
-            session_max_size_kb=int(os.getenv("COPENCLAW_SESSION_MAX_SIZE_KB", "500")),
+            session_max_size_kb=int(os.getenv("COPENCLAW_SESSION_MAX_SIZE_KB", "2000")),
             session_yellow_zone_pct=int(os.getenv("COPENCLAW_SESSION_YELLOW_ZONE_PCT", "70")),
             readme_task_retention_days=int(os.getenv("COPENCLAW_README_TASK_RETENTION_DAYS", "7")),
         )

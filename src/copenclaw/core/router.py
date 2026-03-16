@@ -438,6 +438,7 @@ def handle_chat(
     except CopilotCliError as exc:
         err_str = str(exc)
         is_400 = "400" in err_str and "Bad Request" in err_str
+        is_503 = "503" in err_str
 
         # If a previously stored resume session is stale (for example after a
         # crashed Copilot CLI process), clear it and retry once without resume.
@@ -464,6 +465,13 @@ def handle_chat(
                 )
             except Exception as chk_exc:  # noqa: BLE001
                 logger.warning("Could not write checkpoint during 400 recovery: %s", chk_exc)
+
+            # Collect telemetry before killing the stale session
+            try:
+                from copenclaw.core.gateway import _log_context_telemetry
+                _log_context_telemetry("error_400", session_id=old_sid)
+            except Exception:
+                pass
 
             if old_sid:
                 cli.kill_session(old_sid)
@@ -494,6 +502,22 @@ def handle_chat(
                 logger.info("Auto-rotation succeeded; retried prompt on fresh session")
             except CopilotCliError as retry_exc:
                 output = f"⚠️ Session auto-rotated after 400 error, but retry also failed: {retry_exc}"
+        elif is_503:
+            logger.warning("503 error detected — collecting telemetry: %s", err_str[:200])
+            try:
+                from copenclaw.core.gateway import _log_context_telemetry
+                _log_context_telemetry("error_503")
+            except Exception:
+                pass
+            # Don't rotate on 503 — it's usually transient. Just log and retry.
+            try:
+                output = cli.run_prompt(
+                    prompt_with_reminder,
+                    resume_id=copilot_sid or cli.resume_session_id,
+                    on_line=_should_stop_after_proposal_line,
+                )
+            except CopilotCliError as retry_exc:
+                output = f"⚠️ Service temporarily unavailable (503). Retry failed: {retry_exc}"
         elif had_resume:
             logger.warning("Copilot CLI resume failed for %s; retrying without resume: %s", session_key, exc)
             if copilot_sid:

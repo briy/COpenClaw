@@ -446,6 +446,181 @@ class CopilotCli:
                 total += os.path.getsize(os.path.join(dirpath, f))
         return total // 1024
 
+    # ── Token-based telemetry via /context and /usage ──────────────
+
+    @staticmethod
+    def _parse_token_value(text: str) -> int:
+        """Convert '31.4k' or '9.7m' to integer token count."""
+        m = re.match(r"(\d+\.?\d*)\s*(k|m)", text.strip(), re.IGNORECASE)
+        if not m:
+            return 0
+        value = float(m.group(1))
+        suffix = m.group(2).lower()
+        if suffix == "k":
+            return int(value * 1_000)
+        return int(value * 1_000_000)
+
+    def get_session_metrics(
+        self,
+        session_id: Optional[str] = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Probe a session with /context and /usage, return structured metrics.
+
+        Spawns a short-lived interactive Copilot CLI process that resumes the
+        given session, sends ``/context`` and ``/usage`` slash commands via
+        stdin, parses the text output, and terminates.  The slash commands are
+        read-only and do not modify session history.
+
+        Returns a dict with ``context`` and ``usage`` sub-dicts (either may be
+        empty if parsing fails).  Always includes ``disk_size_kb``.
+        """
+        sid = session_id or self._resume_session_id
+        result: dict[str, Any] = {
+            "session_id": sid or "",
+            "disk_size_kb": self.get_session_size_kb(sid),
+            "context": {},
+            "usage": {},
+        }
+        if not sid:
+            return result
+
+        exe = self._resolve_executable()
+        cmd = [exe, "--resume", sid, "--no-alt-screen"]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=self.workspace_dir or os.getcwd(),
+                env=self._make_env(),
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    if sys.platform == "win32"
+                    else 0
+                ),
+            )
+        except Exception as exc:
+            logger.warning("get_session_metrics: failed to spawn CLI: %s", exc)
+            return result
+
+        try:
+            # Wait for interactive session to initialize
+            time.sleep(4)
+
+            assert proc.stdin is not None
+            proc.stdin.write("/context\n")
+            proc.stdin.flush()
+            time.sleep(3)
+
+            proc.stdin.write("/usage\n")
+            proc.stdin.flush()
+            time.sleep(3)
+
+            proc.stdin.write("/exit\n")
+            proc.stdin.flush()
+
+            # Read all available output
+            try:
+                raw_output, _ = proc.communicate(timeout=timeout - 10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raw_output, _ = proc.communicate(timeout=5)
+
+            result["context"] = self._parse_context_output(raw_output)
+            result["usage"] = self._parse_usage_output(raw_output)
+
+        except Exception as exc:
+            logger.warning("get_session_metrics: error during probe: %s", exc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+        return result
+
+    def _parse_context_output(self, raw: str) -> dict[str, Any]:
+        """Extract token window metrics from /context output."""
+        ctx: dict[str, Any] = {}
+
+        # Summary line: "claude-opus-4.6 · 82k/200k tokens (41%)"
+        m = re.search(
+            r"([\w.-]+)\s+·\s+(\d+\.?\d*)(k|m)/(\d+\.?\d*)(k|m)\s+tokens\s+\((\d+)%\)",
+            raw,
+        )
+        if m:
+            ctx["model"] = m.group(1)
+            ctx["total_tokens"] = self._parse_token_value(m.group(2) + m.group(3))
+            ctx["max_tokens"] = self._parse_token_value(m.group(4) + m.group(5))
+            ctx["pct_used"] = int(m.group(6))
+
+        # Breakdown lines
+        breakdown_pattern = r"(System/Tools|Messages|Free Space|Buffer):\s+(\d+\.?\d*)(k|m)\s+\((\d+)%\)"
+        field_map = {
+            "System/Tools": "system_tokens",
+            "Messages": "message_tokens",
+            "Free Space": "free_tokens",
+            "Buffer": "buffer_tokens",
+        }
+        for match in re.finditer(breakdown_pattern, raw):
+            key = field_map.get(match.group(1))
+            if key:
+                ctx[key] = self._parse_token_value(match.group(2) + match.group(3))
+                ctx[key + "_pct"] = int(match.group(4))
+
+        return ctx
+
+    def _parse_usage_output(self, raw: str) -> dict[str, Any]:
+        """Extract cumulative usage metrics from /usage output."""
+        usage: dict[str, Any] = {}
+
+        # "Total usage est:        63 Premium requests"
+        m = re.search(r"Total usage est:\s+(\d+)\s+Premium", raw)
+        if m:
+            usage["premium_requests"] = int(m.group(1))
+
+        # "API time spent:         27m 53s"
+        m = re.search(r"API time spent:\s+(.+)", raw)
+        if m:
+            usage["api_time"] = m.group(1).strip()
+
+        # "Total session time:     40h 59m 31s"
+        m = re.search(r"Total session time:\s+(.+)", raw)
+        if m:
+            usage["session_time"] = m.group(1).strip()
+
+        # "Total code changes:     +247 -139"
+        m = re.search(r"Total code changes:\s+\+(\d+)\s+-(\d+)", raw)
+        if m:
+            usage["code_additions"] = int(m.group(1))
+            usage["code_deletions"] = int(m.group(2))
+
+        # Per-model breakdown: "claude-opus-4.6  9.7m in, 38.1k out, 9.1m cached (Est. 63 Premium requests)"
+        models: dict[str, dict] = {}
+        model_pattern = (
+            r"([\w.-]+)\s+(\d+\.?\d*)(k|m)\s+in,\s+(\d+\.?\d*)(k|m)\s+out,"
+            r"\s+(\d+\.?\d*)(k|m)\s+cached\s+\(Est\.\s+(\d+)\s+Premium"
+        )
+        for match in re.finditer(model_pattern, raw):
+            models[match.group(1)] = {
+                "input_tokens": self._parse_token_value(match.group(2) + match.group(3)),
+                "output_tokens": self._parse_token_value(match.group(4) + match.group(5)),
+                "cached_tokens": self._parse_token_value(match.group(6) + match.group(7)),
+                "premium_requests": int(match.group(8)),
+            }
+        if models:
+            usage["models"] = models
+
+        return usage
+
     def kill_session(self, session_id: Optional[str] = None) -> bool:
         """Delete a CLI session directory from disk. Returns True if deleted."""
         import shutil
