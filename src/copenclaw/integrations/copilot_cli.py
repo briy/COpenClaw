@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, ClassVar, Literal, Optional
 
 from copenclaw.core.logging_config import (
     append_to_file,
@@ -460,20 +460,33 @@ class CopilotCli:
             return int(value * 1_000)
         return int(value * 1_000_000)
 
+    # Known model context window sizes (tokens).
+    _MODEL_MAX_TOKENS: ClassVar[dict[str, int]] = {
+        "claude-opus-4.6": 200_000,
+        "claude-opus-4.5": 200_000,
+        "claude-sonnet-4.5": 200_000,
+        "claude-sonnet-4.6": 200_000,
+        "claude-sonnet-4": 200_000,
+        "claude-haiku-4.5": 200_000,
+        "gpt-4.1": 1_047_576,
+        "gpt-5.1": 1_047_576,
+        "gpt-5.2": 1_047_576,
+        "gpt-5-mini": 1_047_576,
+    }
+
     def get_session_metrics(
         self,
         session_id: Optional[str] = None,
         timeout: int = 30,
     ) -> dict[str, Any]:
-        """Probe a session with /context and /usage, return structured metrics.
+        """Read session metrics from the Copilot CLI events.jsonl file.
 
-        Spawns a short-lived interactive Copilot CLI process that resumes the
-        given session, sends ``/context`` and ``/usage`` slash commands via
-        stdin, parses the text output, and terminates.  The slash commands are
-        read-only and do not modify session history.
+        Parses the last ``session.shutdown`` event which contains exact token
+        counts reported by the API after each ``-p`` invocation.  Falls back
+        to disk-size only when no events are available.
 
-        Returns a dict with ``context`` and ``usage`` sub-dicts (either may be
-        empty if parsing fails).  Always includes ``disk_size_kb``.
+        Returns a dict with ``context`` and ``usage`` sub-dicts.
+        Always includes ``disk_size_kb`` and ``session_id``.
         """
         sid = session_id or self._resume_session_id
         result: dict[str, Any] = {
@@ -485,141 +498,119 @@ class CopilotCli:
         if not sid:
             return result
 
-        exe = self._resolve_executable()
-        cmd = [exe, "--resume", sid, "--no-alt-screen"]
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=self.workspace_dir or os.getcwd(),
-                env=self._make_env(),
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                    if sys.platform == "win32"
-                    else 0
-                ),
-            )
-        except Exception as exc:
-            logger.warning("get_session_metrics: failed to spawn CLI: %s", exc)
+        events_path = os.path.join(
+            os.path.expanduser("~/.copilot"), "session-state", sid, "events.jsonl"
+        )
+        if not os.path.isfile(events_path):
+            logger.debug("get_session_metrics: no events.jsonl for %s", sid)
             return result
 
         try:
-            # Wait for interactive session to initialize
-            time.sleep(4)
-
-            assert proc.stdin is not None
-            proc.stdin.write("/context\n")
-            proc.stdin.flush()
-            time.sleep(3)
-
-            proc.stdin.write("/usage\n")
-            proc.stdin.flush()
-            time.sleep(3)
-
-            proc.stdin.write("/exit\n")
-            proc.stdin.flush()
-
-            # Read all available output
-            try:
-                raw_output, _ = proc.communicate(timeout=timeout - 10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                raw_output, _ = proc.communicate(timeout=5)
-
-            result["context"] = self._parse_context_output(raw_output)
-            result["usage"] = self._parse_usage_output(raw_output)
-
+            result.update(self._parse_events_jsonl(events_path))
         except Exception as exc:
-            logger.warning("get_session_metrics: error during probe: %s", exc)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
+            logger.warning("get_session_metrics: failed to parse events: %s", exc)
 
         return result
 
-    def _parse_context_output(self, raw: str) -> dict[str, Any]:
-        """Extract token window metrics from /context output."""
-        ctx: dict[str, Any] = {}
+    def _parse_events_jsonl(self, events_path: str) -> dict[str, Any]:
+        """Parse the last session.shutdown event from events.jsonl.
 
-        # Summary line: "claude-opus-4.6 · 82k/200k tokens (41%)"
-        m = re.search(
-            r"([\w.-]+)\s+·\s+(\d+\.?\d*)(k|m)/(\d+\.?\d*)(k|m)\s+tokens\s+\((\d+)%\)",
-            raw,
-        )
-        if m:
-            ctx["model"] = m.group(1)
-            ctx["total_tokens"] = self._parse_token_value(m.group(2) + m.group(3))
-            ctx["max_tokens"] = self._parse_token_value(m.group(4) + m.group(5))
-            ctx["pct_used"] = int(m.group(6))
+        The shutdown event contains::
 
-        # Breakdown lines
-        breakdown_pattern = r"(System/Tools|Messages|Free Space|Buffer):\s+(\d+\.?\d*)(k|m)\s+\((\d+)%\)"
-        field_map = {
-            "System/Tools": "system_tokens",
-            "Messages": "message_tokens",
-            "Free Space": "free_tokens",
-            "Buffer": "buffer_tokens",
-        }
-        for match in re.finditer(breakdown_pattern, raw):
-            key = field_map.get(match.group(1))
-            if key:
-                ctx[key] = self._parse_token_value(match.group(2) + match.group(3))
-                ctx[key + "_pct"] = int(match.group(4))
-
-        return ctx
-
-    def _parse_usage_output(self, raw: str) -> dict[str, Any]:
-        """Extract cumulative usage metrics from /usage output."""
-        usage: dict[str, Any] = {}
-
-        # "Total usage est:        63 Premium requests"
-        m = re.search(r"Total usage est:\s+(\d+)\s+Premium", raw)
-        if m:
-            usage["premium_requests"] = int(m.group(1))
-
-        # "API time spent:         27m 53s"
-        m = re.search(r"API time spent:\s+(.+)", raw)
-        if m:
-            usage["api_time"] = m.group(1).strip()
-
-        # "Total session time:     40h 59m 31s"
-        m = re.search(r"Total session time:\s+(.+)", raw)
-        if m:
-            usage["session_time"] = m.group(1).strip()
-
-        # "Total code changes:     +247 -139"
-        m = re.search(r"Total code changes:\s+\+(\d+)\s+-(\d+)", raw)
-        if m:
-            usage["code_additions"] = int(m.group(1))
-            usage["code_deletions"] = int(m.group(2))
-
-        # Per-model breakdown: "claude-opus-4.6  9.7m in, 38.1k out, 9.1m cached (Est. 63 Premium requests)"
-        models: dict[str, dict] = {}
-        model_pattern = (
-            r"([\w.-]+)\s+(\d+\.?\d*)(k|m)\s+in,\s+(\d+\.?\d*)(k|m)\s+out,"
-            r"\s+(\d+\.?\d*)(k|m)\s+cached\s+\(Est\.\s+(\d+)\s+Premium"
-        )
-        for match in re.finditer(model_pattern, raw):
-            models[match.group(1)] = {
-                "input_tokens": self._parse_token_value(match.group(2) + match.group(3)),
-                "output_tokens": self._parse_token_value(match.group(4) + match.group(5)),
-                "cached_tokens": self._parse_token_value(match.group(6) + match.group(7)),
-                "premium_requests": int(match.group(8)),
+            {
+              "data": {
+                "currentModel": "claude-opus-4.6",
+                "totalPremiumRequests": 63,
+                "totalApiDurationMs": 27530,
+                "modelMetrics": {
+                  "claude-opus-4.6": {
+                    "usage": {
+                      "inputTokens": 92918,
+                      "outputTokens": 227,
+                      "cacheReadTokens": 89216,
+                      "cacheWriteTokens": 0
+                    }
+                  }
+                }
+              }
             }
-        if models:
-            usage["models"] = models
+        """
+        last_shutdown: Optional[dict] = None
 
-        return usage
+        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if '"session.shutdown"' not in line:
+                    continue
+                try:
+                    last_shutdown = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+        if not last_shutdown:
+            return {}
+
+        data = last_shutdown.get("data", {})
+        model = data.get("currentModel", "")
+        model_metrics = data.get("modelMetrics", {})
+        total_premium = data.get("totalPremiumRequests", 0)
+        total_api_ms = data.get("totalApiDurationMs", 0)
+        code_changes = data.get("codeChanges", {})
+
+        # Aggregate token counts across all models (usually just one)
+        total_input = 0
+        total_output = 0
+        total_cached = 0
+        models_detail: dict[str, dict] = {}
+        for m_name, m_data in model_metrics.items():
+            u = m_data.get("usage", {})
+            inp = u.get("inputTokens", 0)
+            out = u.get("outputTokens", 0)
+            cached = u.get("cacheReadTokens", 0)
+            total_input += inp
+            total_output += out
+            total_cached += cached
+            models_detail[m_name] = {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cached_tokens": cached,
+                "requests": m_data.get("requests", {}).get("count", 0),
+                "premium_cost": m_data.get("requests", {}).get("cost", 0),
+            }
+
+        # Derive context window utilization
+        max_tokens = self._MODEL_MAX_TOKENS.get(model, 200_000)
+        # inputTokens from the last API call = how much of the window was used
+        # (the shutdown event records cumulative totals, so we use the last
+        # model-specific input as a proxy — it includes conversation history)
+        last_model_input = 0
+        if model in model_metrics:
+            last_model_input = model_metrics[model].get("usage", {}).get("inputTokens", 0)
+
+        pct_used = round(last_model_input / max_tokens * 100, 1) if max_tokens else 0
+
+        context = {
+            "model": model,
+            "total_tokens": last_model_input + total_output,
+            "input_tokens": last_model_input,
+            "output_tokens": total_output,
+            "cached_tokens": total_cached,
+            "max_tokens": max_tokens,
+            "pct_used": pct_used,
+        }
+
+        usage = {
+            "premium_requests": total_premium,
+            "api_time_ms": total_api_ms,
+            "code_additions": code_changes.get("linesAdded", 0),
+            "code_deletions": code_changes.get("linesRemoved", 0),
+        }
+        if models_detail:
+            usage["models"] = models_detail
+
+        return {"context": context, "usage": usage}
 
     def kill_session(self, session_id: Optional[str] = None) -> bool:
         """Delete a CLI session directory from disk. Returns True if deleted."""

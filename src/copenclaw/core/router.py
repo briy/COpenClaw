@@ -469,7 +469,7 @@ def handle_chat(
             # Collect telemetry before killing the stale session
             try:
                 from copenclaw.core.gateway import _log_context_telemetry
-                _log_context_telemetry("error_400", session_id=old_sid)
+                _log_context_telemetry("error_400", cli, data_dir, session_id=old_sid)
             except Exception:
                 pass
 
@@ -506,7 +506,7 @@ def handle_chat(
             logger.warning("503 error detected — collecting telemetry: %s", err_str[:200])
             try:
                 from copenclaw.core.gateway import _log_context_telemetry
-                _log_context_telemetry("error_503")
+                _log_context_telemetry("error_503", cli, data_dir)
             except Exception:
                 pass
             # Don't rotate on 503 — it's usually transient. Just log and retry.

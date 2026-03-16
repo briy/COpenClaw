@@ -519,30 +519,39 @@ def _prune_readme_tasks(workspace_dir: str, retention_days: int = 7) -> None:
         logger.warning("Failed to write pruned README.md")
 
 
-def _log_context_telemetry(trigger: str, session_id: Optional[str] = None) -> None:
+def _log_context_telemetry(
+    trigger: str,
+    cli_instance,
+    data_dir: str,
+    session_id: Optional[str] = None,
+) -> None:
     """Collect /context and /usage metrics and append to telemetry JSONL.
 
     Runs in a background thread to avoid blocking the caller.
     *trigger* identifies why the collection was initiated (e.g.
     ``periodic``, ``error_400``, ``error_503``, ``yellow_zone``,
     ``pre_rotation``).
+
+    *cli_instance* and *data_dir* must be passed explicitly because this
+    function lives at module scope and cannot close over the locals inside
+    ``create_app()``.
     """
     from datetime import datetime, timezone
 
-    sid = session_id or getattr(cli, "_resume_session_id", None) or getattr(cli, "resume_session_id", None)
+    sid = session_id or getattr(cli_instance, "_resume_session_id", None) or getattr(cli_instance, "resume_session_id", None)
     if not sid:
         logger.info("Telemetry skip: no active session ID")
         return
 
     def _collect():
         try:
-            metrics = cli.get_session_metrics(session_id=sid)
+            metrics = cli_instance.get_session_metrics(session_id=sid)
             record = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "trigger": trigger,
                 **metrics,
             }
-            telemetry_path = os.path.join(settings.data_dir, "context-telemetry.jsonl")
+            telemetry_path = os.path.join(data_dir, "context-telemetry.jsonl")
             os.makedirs(os.path.dirname(telemetry_path), exist_ok=True)
             with open(telemetry_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
@@ -2130,7 +2139,7 @@ def create_app() -> FastAPI:
             global _watchdog_telemetry_counter
             _watchdog_telemetry_counter += 1
             if _watchdog_telemetry_counter % 5 == 0:
-                _log_context_telemetry("periodic")
+                _log_context_telemetry("periodic", cli, settings.data_dir)
 
             # ── Orchestrator session size check (yellow & red zones) ──
             try:
@@ -2167,7 +2176,7 @@ def create_app() -> FastAPI:
                         )
 
                         # 2. Send freeze instructions to active workers
-                        _log_context_telemetry("yellow_zone")
+                        _log_context_telemetry("yellow_zone", cli, settings.data_dir)
                         _freeze_active_workers(task_manager)
 
                         # 3. Write orchestrator checkpoint (best-effort, no LLM summary)
@@ -2242,7 +2251,7 @@ def create_app() -> FastAPI:
         old_sid = cli.resume_session_id
         logger.warning("SESSION ROTATION initiated: %s (old session: %s)", reason, old_sid)
         log_event(settings.data_dir, "session.rotate", {"reason": reason, "old_session_id": old_sid})
-        _log_context_telemetry("pre_rotation")
+        _log_context_telemetry("pre_rotation", cli, settings.data_dir)
 
         # 0. Write checkpoint (best-effort from TaskManager state)
         orchestrator_summary = ""
