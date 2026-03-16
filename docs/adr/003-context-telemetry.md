@@ -13,7 +13,27 @@ Real-world data from `/context` showed this approach is flawed:
 - The 500KB threshold caused frequent unnecessary rotations, which themselves consume tokens (bootstrap prompt, recovery context injection)
 
 ## Decision
-Replace disk-based session size monitoring with token-based telemetry from the Copilot CLI's built-in `/context` and `/usage` commands.
+Collect real token usage data to inform rotation decisions. Originally planned to use the CLI's `/context` and `/usage` slash commands via interactive subprocess, but discovered these commands are TUI-only — piped stdin is treated as user messages by the LLM, not CLI commands.
+
+**Revised approach:** Parse `events.jsonl` from the Copilot CLI session state directory (`~/.copilot/session-state/{id}/events.jsonl`). Each `session.shutdown` event contains exact API-reported token counts:
+
+```json
+{
+  "type": "session.shutdown",
+  "data": {
+    "currentModel": "claude-opus-4.6",
+    "totalPremiumRequests": 6,
+    "totalApiDurationMs": 27884,
+    "modelMetrics": {
+      "claude-opus-4.6": {
+        "usage": { "inputTokens": 138217, "outputTokens": 1137, "cacheReadTokens": 87258 }
+      }
+    }
+  }
+}
+```
+
+This is faster (file read vs subprocess spawn), more reliable, and produces richer data.
 
 ### Phase 1: Instrument (this ADR)
 - Add `get_session_metrics(session_id)` to `copilot_cli.py` that spawns a short-lived interactive Copilot CLI process, sends `/context` and `/usage` via stdin, parses the output, and returns structured metrics
@@ -77,20 +97,16 @@ Breakdown by AI model:
 ## Implementation
 
 ### `get_session_metrics(session_id)` in copilot_cli.py
-1. Spawn: `copilot --resume=SESSION_ID --no-alt-screen`
-2. Wait ~3s for session initialization
-3. Write `/context\n` to stdin, read output, parse with regex
-4. Write `/usage\n` to stdin, read output, parse with regex
-5. Write `/exit\n` to stdin
-6. Terminate process after timeout
-7. Return structured dict
+1. Read `~/.copilot/session-state/{session_id}/events.jsonl`
+2. Find the last `session.shutdown` event
+3. Extract `modelMetrics.{model}.usage.inputTokens` (= context window usage)
+4. Look up model's max tokens from `_MODEL_MAX_TOKENS` table
+5. Compute `pct_used = inputTokens / maxTokens * 100`
+6. Return structured dict with `context` and `usage` sub-dicts
 
-### Regex patterns
-- Context summary: `(\S+)\s+·\s+(\d+\.?\d*)(k|m)/(\d+\.?\d*)(k|m)\s+tokens\s+\((\d+)%\)`
-- Context breakdown: `(System/Tools|Messages|Free Space|Buffer):\s+(\d+\.?\d*)(k|m)\s+\((\d+)%\)`
-- Usage premium: `Total usage est:\s+(\d+)\s+Premium`
-- Usage API time: `API time spent:\s+(.+)`
-- Usage model: `(\S+)\s+(\d+\.?\d*)(k|m)\s+in,\s+(\d+\.?\d*)(k|m)\s+out,\s+(\d+\.?\d*)(k|m)\s+cached`
+### `_log_context_telemetry(trigger, cli, data_dir)` in gateway.py
+- Module-level function (takes `cli` and `data_dir` explicitly to avoid closure scoping issues)
+- Spawns a daemon thread that calls `get_session_metrics()` and appends to `.data/context-telemetry.jsonl`
 
 ### Collection triggers
 | Trigger | Location | When |
@@ -102,7 +118,9 @@ Breakdown by AI model:
 | `pre_rotation` | gateway.py | Before any rotation |
 
 ## Consequences
-- Short-lived interactive process adds ~5s overhead per telemetry collection
-- Telemetry process resumes the same session (read-only `/context` and `/usage` don't modify history)
+- Zero overhead — reads a local file, no subprocess spawn
+- Token counts come directly from the API (exact, not estimated)
 - JSONL file grows unboundedly (acceptable for Phase 1; add rotation in Phase 2 if needed)
 - Disk-KB guard remains as emergency fallback at 2000KB
+- `inputTokens` from `session.shutdown` is cumulative across all API calls in the session, not the instantaneous context window size — but serves as a reliable proxy for context growth
+- `/context` TUI command remains the gold standard for point-in-time window usage; may revisit PTY-based approach in Phase 2 if needed
