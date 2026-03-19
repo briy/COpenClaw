@@ -670,7 +670,7 @@ class WorkerThread:
 
             # Build the command — short trigger prompt since instructions are in the file
             cmd = cli.build_launch_command(require_subprocess=True)
-            cmd.extend(["--model", "auto"])  # Use auto model selection
+
             if self.resume_session_id:
                 cmd.extend(["-p", f"You are worker for task {self.task_id}. You are RESUMING a previous session — you have full context of your earlier work. Check your inbox with task_check_inbox for new instructions, then continue working."])
             else:
