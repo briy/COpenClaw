@@ -398,6 +398,20 @@ TASK_TOOLS = [
 
 ALL_TOOLS = INFRA_TOOLS + TASK_TOOLS
 
+# Tools only meaningful inside a worker/supervisor session.
+# Orchestrator sessions (no role param) should not see these — they reduce
+# context window usage and avoid confusing the orchestrator with ITC tools.
+_WORKER_ONLY_TOOLS = {
+    "task_report",
+    "task_check_inbox",
+    "task_set_status",
+    "task_get_context",
+    "task_read_peer",
+    "task_send_input",
+}
+
+ORCHESTRATOR_TOOLS = [t for t in ALL_TOOLS if t["name"] not in _WORKER_ONLY_TOOLS]
+
 
 class MCPProtocolHandler:
     """Handles MCP JSON-RPC requests and dispatches tool calls."""
@@ -508,9 +522,12 @@ class MCPProtocolHandler:
         }
 
     def _handle_tools_list(self, params: dict[str, Any], role: str | None = None) -> dict[str, Any]:
-        # All tools visible to all roles — orchestrator uses tasks_create
-        # for automated follow-ups (on_complete hooks, scheduled tasks)
-        return {"tools": ALL_TOOLS}
+        # Workers and supervisors get the full tool set.
+        # Orchestrator sessions (role=None) skip the 6 worker-only ITC tools to
+        # reduce schema tokens loaded at bootstrap.
+        if role in ("worker", "supervisor"):
+            return {"tools": ALL_TOOLS}
+        return {"tools": ORCHESTRATOR_TOOLS}
 
     def _handle_tools_call(
         self,
