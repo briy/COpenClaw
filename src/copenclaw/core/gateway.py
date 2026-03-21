@@ -775,13 +775,16 @@ def _ensure_code_link(workspace_dir: str) -> None:
         logger.warning("Failed to create code link: %s", exc)
 
 
-def _deploy_instructions(workspace_dir: str) -> None:
-    """Write the orchestrator system prompt into the workspace.
+def _deploy_instructions(workspace_dir: str, data_dir: str) -> None:
+    """Write the orchestrator system prompt and guide files into the workspace.
 
     Copilot CLI reads ``.github/copilot-instructions.md`` relative to its
     cwd (the workspace directory).  The source-of-truth template lives in
     ``copenclaw/templates/orchestrator.md`` and is loaded via
     :func:`copenclaw.core.templates.orchestrator_template`.
+
+    Guide files (``templates/guides/*.md``) are deployed to ``{data_dir}/guides/``
+    so the orchestrator can lazy-load them via the ``files_read`` MCP tool.
     """
     try:
         content = orchestrator_template()
@@ -797,6 +800,23 @@ def _deploy_instructions(workspace_dir: str) -> None:
     with open(dest, "w", encoding="utf-8") as f:
         f.write(content)
     logger.info("Deployed orchestrator instructions to %s", dest)
+
+    # Deploy lazy-load guide files to data_dir/guides/ for files_read access
+    guides_src = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "templates", "guides"))
+    guides_dest = os.path.join(data_dir, "guides")
+    if os.path.isdir(guides_src):
+        os.makedirs(guides_dest, exist_ok=True)
+        for fname in os.listdir(guides_src):
+            if fname.endswith(".md"):
+                src_path = os.path.join(guides_src, fname)
+                dst_path = os.path.join(guides_dest, fname)
+                with open(src_path, "r", encoding="utf-8") as sf:
+                    guide_content = sf.read()
+                with open(dst_path, "w", encoding="utf-8") as df:
+                    df.write(guide_content)
+        logger.info("Deployed %d guide(s) to %s", len(os.listdir(guides_src)), guides_dest)
+    else:
+        logger.debug("No guides directory found at %s — skipping guide deployment", guides_src)
 
 
 def _build_stale_tasks_message(stale_tasks: list) -> str:
@@ -1182,8 +1202,7 @@ def create_app() -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Backup snapshot failed: %s", exc)
 
-        # Deploy system prompt to workspace so Copilot CLI can find it
-        _deploy_instructions(workspace)
+        _deploy_instructions(workspace, settings.data_dir)
 
         # Seed, prune old tasks, then read workspace README.md
         _seed_readme(workspace)
@@ -2294,7 +2313,7 @@ def create_app() -> FastAPI:
 
         # 5. Bootstrap a fresh session (reads checkpoint automatically via _build_recovery_context)
         workspace = settings.workspace_dir or os.getcwd()
-        _deploy_instructions(workspace)
+        _deploy_instructions(workspace, settings.data_dir)
         _seed_readme(workspace)
         _prune_readme_tasks(workspace, settings.readme_task_retention_days)
         readme_context = _read_readme(workspace)
