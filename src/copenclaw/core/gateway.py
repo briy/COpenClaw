@@ -1433,6 +1433,12 @@ def create_app() -> FastAPI:
         tg = _telegram_adapter()
         typing_stop = tg.start_typing_loop(chat_id)
 
+        # Send an immediate ack for non-slash-command messages so the user
+        # knows the message arrived even if the LLM takes a long time.
+        if not text.startswith("/"):
+            preview = text[:60] + ("…" if len(text) > 60 else "")
+            tg.send_message(chat_id=chat_id, text=f"⏳ Got it: \"{preview}\"\nWorking on it — I'll reply when ready.")
+
         chat_req = ChatRequest(
             channel="telegram",
             sender_id=sender_id_str,
@@ -1707,6 +1713,16 @@ def create_app() -> FastAPI:
             text=text,
             service_url=service_url,
         )
+
+        # Immediate ack for non-slash-command messages
+        if not text.startswith("/"):
+            preview = text[:60] + ("…" if len(text) > 60 else "")
+            _teams_adapter().send_message(
+                service_url=service_url,
+                conversation_id=conversation_id,
+                text=f"⏳ Got it: \"{preview}\"\nWorking on it — I'll reply when ready.",
+            )
+
         resp = handle_chat(
             chat_req,
             pairing=pairing,
