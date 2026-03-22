@@ -65,6 +65,8 @@ class PtySession:
         self._restart_count: int = 0
         self._last_restart_time: float = 0.0
         self._monitor_thread: Optional[threading.Thread] = None
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._consumer_task: Optional[asyncio.Task] = None
 
     def spawn(self) -> None:
         """Launch the Copilot CLI process in a ConPTY.
@@ -107,10 +109,59 @@ class PtySession:
         logger.info(f"[PTY] Spawned session for chat_id={self.chat_id}, pid={self._process.pid}")
         time.sleep(2)
         self._start_monitor_thread()
+        self.start_consumer()
 
     def _start_monitor_thread(self) -> None:
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
+
+    def start_consumer(self) -> None:
+        """Schedule the async consumer coroutine on the running event loop.
+
+        Safe to call from any context — silently skips if no event loop is
+        running (e.g. when spawn() is called from a sync thread; the consumer
+        will be started lazily by the first enqueue() call instead).
+        """
+        if self._consumer_task is not None and not self._consumer_task.done():
+            return
+        try:
+            asyncio.get_running_loop()  # raises RuntimeError if no loop is running
+            self._consumer_task = asyncio.ensure_future(self._consume())
+            logger.info(f"[PTY] Consumer started for chat_id={self.chat_id}")
+        except RuntimeError:
+            logger.debug(f"[PTY] start_consumer called outside event loop for chat_id={self.chat_id}; will start on first enqueue")
+
+    async def _consume(self) -> None:
+        """Drain the per-chat queue one message at a time."""
+        try:
+            while True:
+                text, reply_fn = await self._queue.get()
+                try:
+                    await asyncio.get_event_loop().run_in_executor(None, lambda: self.write(text))
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self.read_until_eom(timeout_sec=120)
+                    )
+                    if response:
+                        await reply_fn(response)
+                except Exception as e:
+                    try:
+                        await reply_fn(f"⚠️ Session error: {e}")
+                    except Exception:
+                        pass
+                finally:
+                    self._queue.task_done()
+        except Exception as e:
+            logger.error(f"[PTY] Consumer died unexpectedly for chat_id={self.chat_id}: {e}")
+
+    async def enqueue(self, text: str, reply_fn) -> None:
+        """Enqueue a message for serialised processing by the consumer coroutine.
+
+        Starts the consumer if it is not already running (safe to call from
+        any async context).
+        """
+        self.start_consumer()
+        await self._queue.put((text, reply_fn))
+        logger.debug(f"[PTY] Enqueued message for {self.chat_id}, queue size={self._queue.qsize()}")
 
     def _monitor_loop(self) -> None:
         while self.is_alive():
@@ -201,6 +252,8 @@ class PtySession:
 
     def close(self) -> None:
         """Terminate the PTY process gracefully. Logs if process was not running."""
+        if self._consumer_task is not None and not self._consumer_task.done():
+            self._consumer_task.cancel()
         if not self.is_alive():
             logger.debug(f"[PTY] close() called but session {self.chat_id} is not running")
             return

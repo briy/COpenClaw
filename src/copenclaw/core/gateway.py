@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import glob
@@ -1294,6 +1295,7 @@ def create_app() -> FastAPI:
     # ---- Telegram polling handler ----
 
     tg_adapter: TelegramAdapter | None = None
+    _main_loop: asyncio.AbstractEventLoop | None = None
 
     # ---- Telegram message dedup ----
     _tg_seen_msgs: set[int] = set()
@@ -1447,16 +1449,22 @@ def create_app() -> FastAPI:
             def on_pty_error(cid: str, error_text: str):
                 tg.send_message(chat_id=int(cid), text=f"⚠️ PTY error: {error_text}")
 
+            async def reply_fn(response_text: str):
+                tg.send_message(chat_id=chat_id, text=response_text)
+                typing_stop.set()
+
             try:
                 session = get_session(str_chat_id, on_error=on_pty_error)
-                session.write(text)
-                response_text = session.read_until_eom(timeout_sec=120)
-                if response_text:
-                    tg.send_message(chat_id=chat_id, text=response_text)
+                if _main_loop is not None:
+                    asyncio.run_coroutine_threadsafe(session.enqueue(text, reply_fn), _main_loop)
+                else:
+                    logger.error("[PTY] No event loop available to enqueue message for %s", str_chat_id)
+                    tg.send_message(chat_id=chat_id, text="⚠️ Server not ready yet, please retry.")
+                    typing_stop.set()
+                # Response will be sent asynchronously by the session consumer
             except Exception as e:
-                logger.error("[PTY] Error handling message for %s: %s", str_chat_id, e)
+                logger.error("[PTY] Error enqueueing message for %s: %s", str_chat_id, e)
                 tg.send_message(chat_id=chat_id, text=f"⚠️ Session error: {e}")
-            finally:
                 typing_stop.set()
         else:
             # Original -p mode path
@@ -1493,7 +1501,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        nonlocal tg_adapter, signal_adapter
+        nonlocal tg_adapter, signal_adapter, _main_loop
+        _main_loop = asyncio.get_running_loop()
 
         # Start scheduler thread
         sched_thread = threading.Thread(target=_scheduler_loop, daemon=True)
@@ -1664,16 +1673,17 @@ def create_app() -> FastAPI:
             def on_pty_error(cid: str, error_text: str):
                 tg.send_message(chat_id=int(cid), text=f"⚠️ PTY error: {error_text}")
 
+            async def reply_fn(response_text: str):
+                tg.send_message(chat_id=chat_id, text=response_text)
+                typing_stop.set()
+
             try:
                 session = get_session(str_chat_id, on_error=on_pty_error)
-                session.write(text)
-                response_text = session.read_until_eom(timeout_sec=120)
-                if response_text:
-                    tg.send_message(chat_id=chat_id, text=response_text)
+                await session.enqueue(text, reply_fn)
+                # Response will be sent asynchronously by the session consumer
             except Exception as e:
-                logger.error("[PTY] Error handling message for %s: %s", str_chat_id, e)
+                logger.error("[PTY] Error enqueueing message for %s: %s", str_chat_id, e)
                 tg.send_message(chat_id=chat_id, text=f"⚠️ Session error: {e}")
-            finally:
                 typing_stop.set()
             return {"status": "ok"}
         else:
