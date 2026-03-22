@@ -2227,6 +2227,48 @@ def create_app() -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Watchdog session size check error: %s", exc)
 
+            # ── Token-based session health check ──
+            try:
+                token_yellow = getattr(settings, "session_token_yellow_pct", 70)
+                token_red = getattr(settings, "session_token_red_pct", 80)
+                if cli.resume_session_id:
+                    metrics = cli.get_session_metrics()
+                    pct = metrics.get("context", {}).get("pct_used")
+                    if pct is not None:
+                        if pct >= token_red:
+                            logger.warning(
+                                "TOKEN RED ZONE: session at %.1f%% of context window; rotating...", pct
+                            )
+                            _notify_owner_message(
+                                settings,
+                                f"🔴 Session context at {pct:.0f}% — rotating now to prevent hangs.",
+                            )
+                            _rotate_orchestrator_session(
+                                f"token red zone: {pct:.1f}% >= {token_red}%",
+                                attempt_orchestrator_checkpoint=True,
+                            )
+                        elif pct >= token_yellow and not getattr(_rotate_orchestrator_session, "_token_yellow_warned", False):
+                            logger.warning(
+                                "TOKEN YELLOW ZONE: session at %.1f%% of context window", pct
+                            )
+                            _rotate_orchestrator_session._token_yellow_warned = True  # type: ignore[attr-defined]
+                            _notify_owner_message(
+                                settings,
+                                f"⚠️ Session context at {pct:.0f}% — saving state and preparing for rotation.",
+                            )
+                            _log_context_telemetry("token_yellow_zone", cli, settings.data_dir)
+                            _freeze_active_workers(task_manager)
+                            _write_orchestrator_checkpoint(
+                                settings.data_dir,
+                                reason=f"token yellow zone: {pct:.1f}%",
+                                task_manager=task_manager,
+                                session_id=cli.resume_session_id,
+                            )
+                        elif pct < token_yellow:
+                            _rotate_orchestrator_session._token_yellow_warned = False  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Watchdog token check error: %s", exc)
+
     # ---- helper: notify owner ----
 
     def _notify_owner_message(settings: Settings, msg: str) -> None:
