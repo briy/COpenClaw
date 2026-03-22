@@ -137,7 +137,39 @@ class PtySession:
             Accumulated PTY output with ANSI codes and EOM_MARKER removed.
             On timeout, returns partial output collected up to that point.
         """
-        raise NotImplementedError
+        if not self.is_alive():
+            raise RuntimeError(f"Session {self.chat_id} is not running")
+
+        buffer = ""
+        deadline = time.monotonic() + timeout_sec
+
+        while True:
+            if time.monotonic() > deadline:
+                logger.warning(f"[PTY] EOM timeout for chat_id={self.chat_id}")
+                break
+
+            try:
+                chunk = self._process.read(4096)
+            except EOFError:
+                logger.warning(f"[PTY] EOF on read for {self.chat_id}")
+                break
+            except Exception as e:
+                logger.warning(f"[PTY] Read error for {self.chat_id}: {e}")
+                break
+
+            if not chunk:
+                time.sleep(0.05)
+                continue
+
+            chunk = self._strip_ansi(chunk)
+            buffer += chunk
+
+            if EOM_MARKER in buffer:
+                pre_eom = buffer.split(EOM_MARKER, 1)[0]
+                logger.debug(f"[PTY] EOM received for {self.chat_id}, {len(buffer)} chars")
+                return pre_eom.strip()
+
+        return buffer.strip()
 
     def _strip_ansi(self, text: str) -> str:
         """Remove ANSI escape sequences from text using ANSI_ESCAPE_RE.
