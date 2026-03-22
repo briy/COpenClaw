@@ -64,6 +64,7 @@ class PtySession:
         self._on_error: Optional[Callable[[str, str], None]] = on_error
         self._restart_count: int = 0
         self._last_restart_time: float = 0.0
+        self._monitor_thread: Optional[threading.Thread] = None
 
     def spawn(self) -> None:
         """Launch the Copilot CLI process in a ConPTY.
@@ -105,6 +106,18 @@ class PtySession:
         )
         logger.info(f"[PTY] Spawned session for chat_id={self.chat_id}, pid={self._process.pid}")
         time.sleep(2)
+        self._start_monitor_thread()
+
+    def _start_monitor_thread(self) -> None:
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def _monitor_loop(self) -> None:
+        while self.is_alive():
+            time.sleep(5)
+        logger.warning(f"[PTY] Process died for chat_id={self.chat_id}")
+        if self._on_error is not None:
+            self._on_error(self.chat_id, "⚠️ Copilot CLI session died unexpectedly. Send any message to restart.")
 
     def write(self, text: str) -> None:
         """Send text to the PTY stdin. Appends newline if not present.
