@@ -2176,57 +2176,6 @@ def create_app() -> FastAPI:
             if _watchdog_telemetry_counter % 5 == 0:
                 _log_context_telemetry("periodic", cli, settings.data_dir)
 
-            # ── Orchestrator session size check (yellow & red zones) ──
-            try:
-                max_kb = getattr(settings, "session_max_size_kb", 500)
-                yellow_pct = getattr(settings, "session_yellow_zone_pct", 70)
-                if max_kb > 0 and cli.resume_session_id:
-                    size_kb = cli.get_session_size_kb()
-                    yellow_kb = int(max_kb * yellow_pct / 100)
-
-                    if size_kb > max_kb:
-                        # RED ZONE — must rotate now
-                        logger.warning(
-                            "RED ZONE: Orchestrator session %s is %d KB (limit %d KB); rotating...",
-                            cli.resume_session_id, size_kb, max_kb,
-                        )
-                        _rotate_orchestrator_session(
-                            f"red zone: size {size_kb}KB > {max_kb}KB limit",
-                            attempt_orchestrator_checkpoint=True,
-                        )
-                    elif size_kb > yellow_kb and not getattr(_rotate_orchestrator_session, "_yellow_warned", False):
-                        # YELLOW ZONE — warn, freeze workers, checkpoint
-                        logger.warning(
-                            "YELLOW ZONE: Orchestrator session %s is %d KB (%d%% of %d KB limit)",
-                            cli.resume_session_id, size_kb, int(size_kb * 100 / max_kb), max_kb,
-                        )
-                        _rotate_orchestrator_session._yellow_warned = True  # type: ignore[attr-defined]
-
-                        # 1. Notify user
-                        _notify_owner_message(
-                            settings,
-                            f"⚠️ Session approaching size limit ({size_kb}KB / {max_kb}KB). "
-                            "Saving state and preparing for rotation. Active workers are being "
-                            "instructed to commit and push their progress.",
-                        )
-
-                        # 2. Send freeze instructions to active workers
-                        _log_context_telemetry("yellow_zone", cli, settings.data_dir)
-                        _freeze_active_workers(task_manager)
-
-                        # 3. Write orchestrator checkpoint (best-effort, no LLM summary)
-                        _write_orchestrator_checkpoint(
-                            settings.data_dir,
-                            reason=f"yellow zone: {size_kb}KB / {max_kb}KB",
-                            task_manager=task_manager,
-                            session_id=cli.resume_session_id,
-                        )
-                    elif size_kb <= yellow_kb:
-                        # Below yellow — reset warning flag
-                        _rotate_orchestrator_session._yellow_warned = False  # type: ignore[attr-defined]
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Watchdog session size check error: %s", exc)
-
             # ── Token-based session health check ──
             # Guard: skip check for 3 minutes after a rotation to avoid
             # immediately re-triggering on the new session's bootstrap cost.
