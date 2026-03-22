@@ -31,6 +31,7 @@ from copenclaw.core.scheduler import Scheduler
 from copenclaw.core.session import SessionStore
 from copenclaw.core.tasks import TaskManager
 from copenclaw.core.worker import WorkerPool
+from copenclaw.core.pty_router import get_session, shutdown_all_sessions
 from copenclaw.integrations.copilot_cli import CopilotCli, CopilotCliError
 from copenclaw.integrations.telegram import TelegramAdapter
 from copenclaw.integrations.teams import TeamsAdapter
@@ -1439,34 +1440,54 @@ def create_app() -> FastAPI:
             preview = text[:60] + ("…" if len(text) > 60 else "")
             tg.send_message(chat_id=chat_id, text=f"⏳ Got it: \"{preview}\"\nWorking on it — I'll reply when ready.")
 
-        chat_req = ChatRequest(
-            channel="telegram",
-            sender_id=sender_id_str,
-            chat_id=str(chat_id),
-            text=text,
-        )
-        try:
-            resp = handle_chat(
-                chat_req,
-                pairing=pairing,
-                sessions=sessions,
-                cli=cli,
-                allow_from=settings.telegram_allow_from,
-                data_dir=settings.data_dir,
-                owner_id=settings.telegram_owner_chat_id,
-                task_manager=task_manager,
-                scheduler=scheduler,
-                worker_pool=worker_pool,
-                on_task_approved=_on_task_approved,
-                on_task_cancelled=_on_task_cancelled,
-                on_task_retry_approved=_on_task_retry_approved,
-                on_task_retry_rejected=_on_task_retry_rejected,
-                on_restart=_restart_app,
-                on_repair=_on_repair,
+        if settings.pty_bridge_mode:
+            # PTY bridge path
+            str_chat_id = str(chat_id)
+
+            def on_pty_error(cid: str, error_text: str):
+                tg.send_message(chat_id=int(cid), text=f"⚠️ PTY error: {error_text}")
+
+            try:
+                session = get_session(str_chat_id, on_error=on_pty_error)
+                session.write(text)
+                response_text = session.read_until_eom(timeout_sec=120)
+                if response_text:
+                    tg.send_message(chat_id=chat_id, text=response_text)
+            except Exception as e:
+                logger.error("[PTY] Error handling message for %s: %s", str_chat_id, e)
+                tg.send_message(chat_id=chat_id, text=f"⚠️ Session error: {e}")
+            finally:
+                typing_stop.set()
+        else:
+            # Original -p mode path
+            chat_req = ChatRequest(
+                channel="telegram",
+                sender_id=sender_id_str,
+                chat_id=str(chat_id),
+                text=text,
             )
-        finally:
-            typing_stop.set()
-        tg.send_message(chat_id=chat_id, text=resp.text)
+            try:
+                resp = handle_chat(
+                    chat_req,
+                    pairing=pairing,
+                    sessions=sessions,
+                    cli=cli,
+                    allow_from=settings.telegram_allow_from,
+                    data_dir=settings.data_dir,
+                    owner_id=settings.telegram_owner_chat_id,
+                    task_manager=task_manager,
+                    scheduler=scheduler,
+                    worker_pool=worker_pool,
+                    on_task_approved=_on_task_approved,
+                    on_task_cancelled=_on_task_cancelled,
+                    on_task_retry_approved=_on_task_retry_approved,
+                    on_task_retry_rejected=_on_task_retry_rejected,
+                    on_restart=_restart_app,
+                    on_repair=_on_repair,
+                )
+            finally:
+                typing_stop.set()
+            tg.send_message(chat_id=chat_id, text=resp.text)
 
     # ---- lifespan ----
 
@@ -1517,6 +1538,7 @@ def create_app() -> FastAPI:
             tg_adapter.stop_polling()
         if signal_adapter:
             signal_adapter.stop_polling()
+        shutdown_all_sessions()
 
     app = FastAPI(title="COpenClaw", version="0.2.0", lifespan=lifespan)
 
@@ -1635,35 +1657,56 @@ def create_app() -> FastAPI:
         tg = _telegram_adapter()
         typing_stop = tg.start_typing_loop(chat_id)
 
-        chat_req = ChatRequest(
-            channel="telegram",
-            sender_id=sender_id_str,
-            chat_id=str(chat_id),
-            text=text,
-        )
-        try:
-            resp = handle_chat(
-                chat_req,
-                pairing=pairing,
-                sessions=sessions,
-                cli=cli,
-                allow_from=settings.telegram_allow_from,
-                data_dir=settings.data_dir,
-                owner_id=settings.telegram_owner_chat_id,
-                task_manager=task_manager,
-                scheduler=scheduler,
-                worker_pool=worker_pool,
-                on_task_approved=_on_task_approved,
-                on_task_cancelled=_on_task_cancelled,
-                on_task_retry_approved=_on_task_retry_approved,
-                on_task_retry_rejected=_on_task_retry_rejected,
-                on_restart=_restart_app,
-                on_repair=_on_repair,
+        if settings.pty_bridge_mode:
+            # PTY bridge path
+            str_chat_id = str(chat_id)
+
+            def on_pty_error(cid: str, error_text: str):
+                tg.send_message(chat_id=int(cid), text=f"⚠️ PTY error: {error_text}")
+
+            try:
+                session = get_session(str_chat_id, on_error=on_pty_error)
+                session.write(text)
+                response_text = session.read_until_eom(timeout_sec=120)
+                if response_text:
+                    tg.send_message(chat_id=chat_id, text=response_text)
+            except Exception as e:
+                logger.error("[PTY] Error handling message for %s: %s", str_chat_id, e)
+                tg.send_message(chat_id=chat_id, text=f"⚠️ Session error: {e}")
+            finally:
+                typing_stop.set()
+            return {"status": "ok"}
+        else:
+            # Original -p mode path
+            chat_req = ChatRequest(
+                channel="telegram",
+                sender_id=sender_id_str,
+                chat_id=str(chat_id),
+                text=text,
             )
-        finally:
-            typing_stop.set()
-        tg.send_message(chat_id=chat_id, text=resp.text)
-        return {"status": resp.status}
+            try:
+                resp = handle_chat(
+                    chat_req,
+                    pairing=pairing,
+                    sessions=sessions,
+                    cli=cli,
+                    allow_from=settings.telegram_allow_from,
+                    data_dir=settings.data_dir,
+                    owner_id=settings.telegram_owner_chat_id,
+                    task_manager=task_manager,
+                    scheduler=scheduler,
+                    worker_pool=worker_pool,
+                    on_task_approved=_on_task_approved,
+                    on_task_cancelled=_on_task_cancelled,
+                    on_task_retry_approved=_on_task_retry_approved,
+                    on_task_retry_rejected=_on_task_retry_rejected,
+                    on_restart=_restart_app,
+                    on_repair=_on_repair,
+                )
+            finally:
+                typing_stop.set()
+            tg.send_message(chat_id=chat_id, text=resp.text)
+            return {"status": resp.status}
 
     # ---- Teams webhook ----
 

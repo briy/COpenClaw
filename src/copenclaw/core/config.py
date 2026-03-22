@@ -48,6 +48,7 @@ class Settings:
     session_token_yellow_pct: int
     session_token_red_pct: int
     readme_task_retention_days: int
+    pty_bridge_mode: bool  # If True, use persistent PTY sessions instead of -p subprocess
 
     @staticmethod
     def from_env() -> "Settings":
@@ -102,4 +103,5 @@ class Settings:
             session_token_yellow_pct=int(os.getenv("COPENCLAW_SESSION_TOKEN_YELLOW_PCT", "85")),
             session_token_red_pct=int(os.getenv("COPENCLAW_SESSION_TOKEN_RED_PCT", "92")),
             readme_task_retention_days=int(os.getenv("COPENCLAW_README_TASK_RETENTION_DAYS", "7")),
+            pty_bridge_mode=os.getenv("PTY_BRIDGE_MODE", "false").lower() in {"1", "true", "yes"},
         )
