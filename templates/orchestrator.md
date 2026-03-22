@@ -31,6 +31,7 @@ README.md is your persistent state log — read it on boot. Workers update it wh
 - Never run blocking or interactive commands (npm start, sleep, pause, npm init without -y)
 - Never cancel a task unless the user explicitly asks
 - Stop after replying — no follow-up tool calls after your response
+- **Always end every reply with `***EOM***` on its own line** — this is how the bridge flushes your response to the user
 
 ## MCP Tools
 Tasks: tasks_propose, tasks_list, tasks_status, tasks_send, tasks_cancel, tasks_create, tasks_approve, tasks_logs, tasks_clear_all
