@@ -2228,10 +2228,16 @@ def create_app() -> FastAPI:
                 logger.error("Watchdog session size check error: %s", exc)
 
             # ── Token-based session health check ──
+            # Guard: skip check for 3 minutes after a rotation to avoid
+            # immediately re-triggering on the new session's bootstrap cost.
+            _token_last_rotation = getattr(_watchdog_loop, "_token_last_rotation", 0.0)
+            _token_cooldown_secs = 180
             try:
-                token_yellow = getattr(settings, "session_token_yellow_pct", 70)
-                token_red = getattr(settings, "session_token_red_pct", 80)
-                if cli.resume_session_id:
+                import time as _wtime
+                token_yellow = getattr(settings, "session_token_yellow_pct", 85)
+                token_red = getattr(settings, "session_token_red_pct", 92)
+                now_ts = _wtime.monotonic()
+                if cli.resume_session_id and (now_ts - _token_last_rotation) > _token_cooldown_secs:
                     metrics = cli.get_session_metrics()
                     pct = metrics.get("context", {}).get("pct_used")
                     if pct is not None:
@@ -2243,6 +2249,7 @@ def create_app() -> FastAPI:
                                 settings,
                                 f"🔴 Session context at {pct:.0f}% — rotating now to prevent hangs.",
                             )
+                            _watchdog_loop._token_last_rotation = _wtime.monotonic()  # type: ignore[attr-defined]
                             _rotate_orchestrator_session(
                                 f"token red zone: {pct:.1f}% >= {token_red}%",
                                 attempt_orchestrator_checkpoint=True,
