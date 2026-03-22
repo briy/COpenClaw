@@ -188,7 +188,16 @@ class PtySession:
 
     def close(self) -> None:
         """Terminate the PTY process gracefully. Logs if process was not running."""
-        raise NotImplementedError
+        if not self.is_alive():
+            logger.debug(f"[PTY] close() called but session {self.chat_id} is not running")
+            return
+        try:
+            self._process.terminate()
+        except Exception as e:
+            logger.warning(f"[PTY] Error terminating {self.chat_id}: {e}")
+        finally:
+            self._process = None
+        logger.info(f"[PTY] Closed session for chat_id={self.chat_id}")
 
     def restart(self) -> None:
         """Close existing process if alive, then call spawn().
@@ -196,7 +205,11 @@ class PtySession:
         Increments ``_restart_count`` and records ``_last_restart_time``.
         Logs the restart attempt including ``chat_id`` and the new count.
         """
-        raise NotImplementedError
+        self.close()
+        self._restart_count += 1
+        self._last_restart_time = time.time()
+        logger.info(f"[PTY] Restarting session {self.chat_id} (attempt #{self._restart_count})")
+        self.spawn()
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +245,13 @@ class ChatSessionMap:
         Returns:
             The live ``PtySession`` for this chat.
         """
-        raise NotImplementedError
+        with self._lock:
+            if chat_id in self._sessions and self._sessions[chat_id].is_alive():
+                return self._sessions[chat_id]
+            session = PtySession(chat_id, instructions_path, on_error)
+            session.spawn()
+            self._sessions[chat_id] = session
+            return session
 
     def get(self, chat_id: str) -> Optional[PtySession]:
         """Return session for chat_id if it exists, else None.
@@ -243,7 +262,8 @@ class ChatSessionMap:
         Returns:
             Existing ``PtySession`` or ``None``.
         """
-        raise NotImplementedError
+        with self._lock:
+            return self._sessions.get(chat_id)
 
     def remove(self, chat_id: str) -> None:
         """Close and remove session for chat_id if present.
@@ -251,7 +271,11 @@ class ChatSessionMap:
         Args:
             chat_id: Telegram chat identifier.
         """
-        raise NotImplementedError
+        with self._lock:
+            if chat_id in self._sessions:
+                self._sessions[chat_id].close()
+                del self._sessions[chat_id]
+                logger.info(f"[PTY] Removed session {chat_id}")
 
     def active_sessions(self) -> Dict[str, PtySession]:
         """Return a snapshot dict of all currently tracked sessions.
@@ -259,4 +283,5 @@ class ChatSessionMap:
         Returns:
             A shallow copy of the internal ``{chat_id: PtySession}`` mapping.
         """
-        raise NotImplementedError
+        with self._lock:
+            return dict(self._sessions)
