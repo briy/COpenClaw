@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -74,7 +75,36 @@ class PtySession:
             RuntimeError: If the process is already running or the host OS is
                 not Windows.
         """
-        raise NotImplementedError
+        if sys.platform != "win32":
+            raise RuntimeError("PTY bridge requires Windows (ConPTY)")
+        if self.is_alive():
+            raise RuntimeError(f"Session {self.chat_id} is already running")
+
+        copilot_cmd = shutil.which("copilot")
+        if copilot_cmd is None:
+            username = os.environ.get("USERNAME", os.environ.get("USER", ""))
+            candidates = [
+                rf"C:\Users\{username}\AppData\Roaming\npm\copilot.cmd",
+                r"C:\Program Files\GitHub Copilot CLI\copilot.cmd",
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    copilot_cmd = path
+                    break
+        if copilot_cmd is None:
+            raise RuntimeError("Could not find the copilot executable")
+
+        env = dict(os.environ)
+        if self.instructions_path is not None and self.instructions_path.exists():
+            env["COPILOT_INSTRUCTIONS_FILE"] = str(self.instructions_path)
+
+        self._process = PtyProcess.spawn(
+            [copilot_cmd],
+            env=env,
+            dimensions=(50, 220),
+        )
+        logger.info(f"[PTY] Spawned session for chat_id={self.chat_id}, pid={self._process.pid}")
+        time.sleep(2)
 
     def write(self, text: str) -> None:
         """Send text to the PTY stdin. Appends newline if not present.
@@ -85,7 +115,13 @@ class PtySession:
         Raises:
             RuntimeError: If the process is not currently alive.
         """
-        raise NotImplementedError
+        if not self.is_alive():
+            raise RuntimeError(f"Session {self.chat_id} is not running")
+        with self._lock:
+            if not text.endswith("\n"):
+                text += "\n"
+            self._process.write(text)
+            logger.debug(f"[PTY] write to {self.chat_id}: {text[:80]!r}")
 
     def read_until_eom(self, timeout_sec: float = DEFAULT_EOM_TIMEOUT_SEC) -> str:
         """Read PTY output until EOM_MARKER is seen or timeout expires.
@@ -112,11 +148,11 @@ class PtySession:
         Returns:
             Text with all ANSI escape sequences removed.
         """
-        raise NotImplementedError
+        return ANSI_ESCAPE_RE.sub('', text)
 
     def is_alive(self) -> bool:
         """Return True if the PTY process exists and has not exited."""
-        raise NotImplementedError
+        return self._process is not None and self._process.isalive()
 
     def close(self) -> None:
         """Terminate the PTY process gracefully. Logs if process was not running."""
