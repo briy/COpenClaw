@@ -1508,9 +1508,10 @@ def create_app() -> FastAPI:
         sched_thread = threading.Thread(target=_scheduler_loop, daemon=True)
         sched_thread.start()
 
-        # Start watchdog thread for stuck tasks
-        watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True, name="task-watchdog")
-        watchdog_thread.start()
+        # Start watchdog thread for stuck tasks — skip in PTY bridge mode (no -p brain to monitor)
+        if not settings.pty_bridge_mode:
+            watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True, name="task-watchdog")
+            watchdog_thread.start()
 
         # Start Telegram polling if configured
         if settings.telegram_bot_token:
@@ -1534,9 +1535,12 @@ def create_app() -> FastAPI:
                 "Signal configuration incomplete: set both SIGNAL_API_URL and SIGNAL_PHONE_NUMBER to enable Signal."
             )
 
-        # Bootstrap brain in a separate thread so it doesn't block server startup
-        boot_thread = threading.Thread(target=_bootstrap_brain, daemon=True)
-        boot_thread.start()
+        # Bootstrap brain in a separate thread — skip in PTY bridge mode (no -p brain needed)
+        if not settings.pty_bridge_mode:
+            boot_thread = threading.Thread(target=_bootstrap_brain, daemon=True)
+            boot_thread.start()
+        else:
+            logger.info("PTY bridge mode enabled — skipping -p brain bootstrap")
 
         yield
 
