@@ -137,12 +137,14 @@ class PtySession:
             while True:
                 text, reply_fn = await self._queue.get()
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, lambda: self.write(text))
-                    response = await asyncio.get_event_loop().run_in_executor(
+                    # Prepend EOM reminder so the model always knows to emit the marker
+                    eom_primed = f"[SYSTEM: You MUST end your response with {EOM_MARKER} on its own line — this is required for delivery.]\n\n{text}"
+                    await asyncio.get_running_loop().run_in_executor(None, lambda: self.write(eom_primed))
+                    response = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: self.read_until_eom(timeout_sec=120)
                     )
-                    if response:
-                        await reply_fn(response)
+                    # Always reply — even on timeout send partial output or a notice
+                    await reply_fn(response if response else "⚠️ No response received (timeout). Try again.")
                 except Exception as e:
                     try:
                         await reply_fn(f"⚠️ Session error: {e}")
