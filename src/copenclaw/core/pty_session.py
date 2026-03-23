@@ -264,6 +264,8 @@ class PtySession:
             while True:
                 text, reply_fn = await self._queue.get()
                 try:
+                    # Flush stale output from previous response before writing new message
+                    await asyncio.get_running_loop().run_in_executor(None, self._flush_read_queue)
                     # Prepend EOM reminder so the model always knows to emit the marker
                     eom_primed = f"[SYSTEM: You MUST end your response with {EOM_MARKER} on its own line — this is required for delivery.]\n\n{text}"
                     await asyncio.get_running_loop().run_in_executor(None, lambda: self.write(eom_primed))
@@ -300,6 +302,18 @@ class PtySession:
         logger.warning(f"[PTY] Process died for chat_id={self.chat_id}")
         if self._on_error is not None:
             self._on_error(self.chat_id, "⚠️ Copilot CLI session died unexpectedly. Send any message to restart.")
+
+    def _flush_read_queue(self) -> None:
+        """Drain any stale output from the read queue before sending a new message."""
+        flushed = 0
+        while not self._read_queue.empty():
+            try:
+                self._read_queue.get_nowait()
+                flushed += 1
+            except stdlib_queue.Empty:
+                break
+        if flushed:
+            logger.debug(f"[PTY] Flushed {flushed} stale chunks for {self.chat_id}")
 
     def write(self, text: str) -> None:
         """Send text to the PTY stdin. Appends newline if not present.
