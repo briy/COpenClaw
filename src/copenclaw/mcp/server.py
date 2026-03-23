@@ -226,7 +226,6 @@ def get_router(
                         "service_url": "string?",
                     }
                 },
-                "files.read": {"input": {"path": "string"}},
                 "audit.read": {"input": {"limit": "int?"}},
                 "tasks.clear_all": {"input": {}},
                 "app.restart": {"input": {"reason": "string?"}},
@@ -255,7 +254,6 @@ def get_router(
                         "jobs.cancel",
                         "jobs.clear_all",
                         "send.message",
-                        "files.read",
                         "audit.read",
                         "tasks.clear_all",
                         "app.restart",
