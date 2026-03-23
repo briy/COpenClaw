@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import queue as stdlib_queue
 import re
 import shutil
 import sys
@@ -80,6 +81,8 @@ class PtySession:
         self._restart_count: int = 0
         self._last_restart_time: float = 0.0
         self._monitor_thread: Optional[threading.Thread] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._read_queue: stdlib_queue.Queue = stdlib_queue.Queue()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._consumer_task: Optional[asyncio.Task] = None
 
@@ -123,8 +126,35 @@ class PtySession:
         )
         logger.info(f"[PTY] Spawned session for chat_id={self.chat_id}, pid={self._process.pid}")
         time.sleep(2)
+        self._start_reader_thread()
         self._start_monitor_thread()
         self.start_consumer()
+
+    def _start_reader_thread(self) -> None:
+        """Start a background thread that continuously drains the PTY into _read_queue."""
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        """Continuously read from the PTY process and push chunks into _read_queue.
+
+        Runs until the process dies or raises EOFError. Uses a sentinel None
+        to signal EOF to read_until_eom callers.
+        """
+        while self.is_alive():
+            try:
+                chunk = self._process.read(4096)
+                if chunk:
+                    self._read_queue.put(chunk)
+                else:
+                    time.sleep(0.02)
+            except EOFError:
+                break
+            except Exception as e:
+                logger.warning(f"[PTY] Reader error for {self.chat_id}: {e}")
+                break
+        self._read_queue.put(None)  # sentinel: EOF
+        logger.debug(f"[PTY] Reader thread exiting for {self.chat_id}")
 
     def _start_monitor_thread(self) -> None:
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -209,16 +239,12 @@ class PtySession:
     def read_until_eom(self, timeout_sec: float = DEFAULT_EOM_TIMEOUT_SEC) -> str:
         """Read PTY output until EOM_MARKER is seen or timeout expires.
 
-        Strips ANSI escape codes from the accumulated output before returning.
-        The EOM_MARKER itself is removed from the returned string.
+        Consumes from the background _read_queue (populated by _reader_loop)
+        using per-chunk timeouts so the overall deadline is always respected —
+        even when the PTY has no pending output and read() would block.
 
-        Args:
-            timeout_sec: Maximum seconds to wait for the marker before giving
-                up and returning whatever has been collected so far.
-
-        Returns:
-            Accumulated PTY output with ANSI codes and EOM_MARKER removed.
-            On timeout, returns partial output collected up to that point.
+        Returns accumulated text with ANSI codes and EOM_MARKER stripped.
+        Returns partial output on timeout or EOF.
         """
         if not self.is_alive():
             raise RuntimeError(f"Session {self.chat_id} is not running")
@@ -227,22 +253,19 @@ class PtySession:
         deadline = time.monotonic() + timeout_sec
 
         while True:
-            if time.monotonic() > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 logger.warning(f"[PTY] EOM timeout for chat_id={self.chat_id}")
                 break
 
             try:
-                chunk = self._process.read(4096)
-            except EOFError:
-                logger.warning(f"[PTY] EOF on read for {self.chat_id}")
-                break
-            except Exception as e:
-                logger.warning(f"[PTY] Read error for {self.chat_id}: {e}")
-                break
+                chunk = self._read_queue.get(timeout=min(1.0, remaining))
+            except stdlib_queue.Empty:
+                continue  # loop back and recheck deadline
 
-            if not chunk:
-                time.sleep(0.05)
-                continue
+            if chunk is None:  # EOF sentinel from reader thread
+                logger.warning(f"[PTY] EOF sentinel received for {self.chat_id}")
+                break
 
             chunk = self._strip_ansi(chunk)
             buffer += chunk
