@@ -183,34 +183,54 @@ class PtySession:
     def _wait_for_ready(self) -> None:
         """Block until Copilot CLI has finished loading and shows its prompt.
 
-        Drains startup output from _read_queue looking for ready patterns.
-        Times out after READY_TIMEOUT_SEC and proceeds anyway.
+        Strategy: first wait for a known ready pattern (``shift+tab`` in the
+        prompt area), then wait for output to go silent for 3 seconds — meaning
+        the loading spinners have stopped and the CLI is truly idle.
         """
         deadline = time.monotonic() + READY_TIMEOUT_SEC
         startup_buf = ""
+        found_pattern = False
+
         while time.monotonic() < deadline:
             try:
                 chunk = self._read_queue.get(timeout=1.0)
             except stdlib_queue.Empty:
+                if found_pattern:
+                    # We saw the prompt pattern AND had 1s of silence — check for 3s total
+                    pass
                 continue
             if chunk is None:  # EOF
                 logger.warning(f"[PTY] EOF during startup wait for {self.chat_id}")
                 break
             startup_buf += chunk
-            # Check for ready patterns in accumulated output
-            lower = startup_buf.lower()
-            for pattern in _READY_PATTERNS:
-                if pattern.lower() in lower:
-                    logger.info(f"[PTY] Ready detected for chat_id={self.chat_id} (matched '{pattern}')")
-                    # Drain any remaining queued startup output quickly
-                    time.sleep(0.5)
-                    while not self._read_queue.empty():
-                        try:
-                            self._read_queue.get_nowait()
-                        except stdlib_queue.Empty:
-                            break
-                    return
-        logger.warning(f"[PTY] Ready timeout for chat_id={self.chat_id} after {READY_TIMEOUT_SEC}s")
+            if not found_pattern:
+                lower = startup_buf.lower()
+                for pattern in _READY_PATTERNS:
+                    if pattern.lower() in lower:
+                        found_pattern = True
+                        logger.debug(f"[PTY] Ready pattern matched for {self.chat_id}: '{pattern}'")
+                        break
+
+        # Now wait for silence — no output for 3 seconds means spinners stopped
+        silence_start = time.monotonic()
+        silence_needed = 3.0
+        while time.monotonic() - silence_start < silence_needed and time.monotonic() < deadline:
+            try:
+                chunk = self._read_queue.get(timeout=0.5)
+                if chunk is None:
+                    break
+                silence_start = time.monotonic()  # reset silence timer on new output
+            except stdlib_queue.Empty:
+                continue  # no output — silence continues
+
+        # Final flush of anything left
+        while not self._read_queue.empty():
+            try:
+                self._read_queue.get_nowait()
+            except stdlib_queue.Empty:
+                break
+
+        logger.info(f"[PTY] Ready for chat_id={self.chat_id} (pattern={'found' if found_pattern else 'timeout'})")
 
     def _start_reader_thread(self) -> None:
         """Start a background thread that continuously drains the PTY into _read_queue."""
@@ -266,9 +286,15 @@ class PtySession:
                 try:
                     # Flush stale output from previous response before writing new message
                     await asyncio.get_running_loop().run_in_executor(None, self._flush_read_queue)
-                    # Prepend EOM reminder so the model always knows to emit the marker
-                    eom_primed = f"[SYSTEM: You MUST end your response with {EOM_MARKER} on its own line — this is required for delivery.]\n\n{text}"
-                    await asyncio.get_running_loop().run_in_executor(None, lambda: self.write(eom_primed))
+                    # Write the user's message — per-chat instructions already tell Copilot
+                    # to end responses with EOM_MARKER. Do NOT include the marker in the
+                    # written text or the PTY echo will trigger false EOM detection.
+                    await asyncio.get_running_loop().run_in_executor(None, lambda: self.write(text))
+                    # Skip the input echo — wait 2s for the PTY to echo back the typed text
+                    # then flush it so read_until_eom only sees Copilot's actual response
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._skip_echo(2.0)
+                    )
                     response = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: self.read_until_eom(timeout_sec=120)
                     )
@@ -314,6 +340,27 @@ class PtySession:
                 break
         if flushed:
             logger.debug(f"[PTY] Flushed {flushed} stale chunks for {self.chat_id}")
+
+    def _skip_echo(self, duration: float = 2.0) -> None:
+        """Drain PTY output for `duration` seconds to skip the echoed input.
+
+        After writing to a PTY, the terminal echoes the typed text back.
+        This echo can contain patterns that confuse read_until_eom.
+        We discard output during this window so only Copilot's real response
+        is seen by the reader.
+        """
+        deadline = time.monotonic() + duration
+        skipped = 0
+        while time.monotonic() < deadline:
+            try:
+                chunk = self._read_queue.get(timeout=0.2)
+                if chunk is None:
+                    self._read_queue.put(None)  # re-queue the EOF sentinel
+                    break
+                skipped += len(chunk)
+            except stdlib_queue.Empty:
+                continue
+        logger.debug(f"[PTY] Skipped {skipped} echo chars for {self.chat_id}")
 
     def write(self, text: str) -> None:
         """Send text to the PTY stdin. Appends newline if not present.
