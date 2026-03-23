@@ -31,6 +31,21 @@ if sys.platform == "win32":
 EOM_MARKER = "***EOM***"
 DEFAULT_EOM_TIMEOUT_SEC = 120
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+_TG_MAX_CHARS = 4000  # Telegram limit is 4096; leave headroom
+
+
+def _clean_pty_output(text: str) -> str:
+    """Strip ANSI, control chars, and truncate to Telegram's message limit."""
+    # Remove ANSI escape sequences
+    text = ANSI_ESCAPE_RE.sub('', text)
+    # Remove other non-printable control characters (except newline/tab)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Collapse excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = text.strip()
+    if len(text) > _TG_MAX_CHARS:
+        text = text[:_TG_MAX_CHARS] + '\n…(truncated)'
+    return text
 
 logger = logging.getLogger(__name__)
 
@@ -143,13 +158,15 @@ class PtySession:
                     response = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: self.read_until_eom(timeout_sec=120)
                     )
-                    # Always reply — even on timeout send partial output or a notice
-                    await reply_fn(response if response else "⚠️ No response received (timeout). Try again.")
+                    # Clean up TUI artifacts and enforce Telegram 4096-char limit
+                    response = _clean_pty_output(response)
+                    await reply_fn(response if response else "⚠️ No response (timeout). Try again.")
                 except Exception as e:
+                    logger.error(f"[PTY] Consumer error for {self.chat_id}: {e}")
                     try:
-                        await reply_fn(f"⚠️ Session error: {e}")
-                    except Exception:
-                        pass
+                        await reply_fn(f"⚠️ Session error: {e}"[:500])
+                    except Exception as inner:
+                        logger.error(f"[PTY] reply_fn also failed for {self.chat_id}: {inner}")
                 finally:
                     self._queue.task_done()
         except Exception as e:
