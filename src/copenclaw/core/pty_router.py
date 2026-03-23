@@ -33,9 +33,11 @@ _session_map: ChatSessionMap = ChatSessionMap()
 def get_instructions_path(chat_id: str) -> Optional[Path]:
     """Return path to per-chat copilot-instructions.md if it exists, else None.
 
-    Convention: ``~/.copenclaw/chats/<chat_id>/copilot-instructions.md``
+    Convention: ``~/.copenclaw/chats/<chat_id>/.github/copilot-instructions.md``
+    (placed under ``.github/`` so Copilot CLI finds it natively when the chat
+    directory is used as the working directory).
     """
-    candidate = CHATS_DIR / str(chat_id) / "copilot-instructions.md"
+    candidate = CHATS_DIR / str(chat_id) / ".github" / "copilot-instructions.md"
     return candidate if candidate.exists() else None
 
 

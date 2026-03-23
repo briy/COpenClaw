@@ -31,18 +31,53 @@ if sys.platform == "win32":
 
 EOM_MARKER = "***EOM***"
 DEFAULT_EOM_TIMEOUT_SEC = 120
+READY_TIMEOUT_SEC = 90  # max time to wait for Copilot CLI to finish loading
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+# OSC sequences: \x1B] ... \x07  (or \x1B\\)
+OSC_RE = re.compile(r'\x1B\][^\x07]*\x07|\x1B\].*?\x1B\\')
+# CSI sequences missed by the simple regex
+CSI_RE = re.compile(r'\x1B\[[0-9;]*[A-Za-z]')
 _TG_MAX_CHARS = 4000  # Telegram limit is 4096; leave headroom
+
+# Patterns that indicate Copilot CLI is ready for input
+_READY_PATTERNS = [
+    'shift+tab',       # appears in the prompt area
+    'Type @ to mention',  # prompt text
+]
+
+# TUI chrome to strip from output before sending to Telegram
+_TUI_CHROME_PATTERNS = [
+    re.compile(r'[╭╮╰╯│─┌┐└┘├┤┬┴┼]+'),  # box-drawing
+    re.compile(r'[◉◎○●▘▝█▔]+'),           # spinner / block chars
+    re.compile(r'\d+;\d*;?\d*;?\d*'),       # OSC numeric params (0;C:\..., 9;4;0;0)
+    re.compile(r'shift\+tab switch mode'),  # TUI hint
+    re.compile(r'Type @ to mention.*shortcuts', re.DOTALL),  # prompt hint block
+    re.compile(r'Loading environment:.*', re.MULTILINE),  # spinner lines
+    re.compile(r'Unlimited reqs\..*', re.MULTILINE),  # status bar
+    re.compile(r'claude-opus-\S+.*', re.MULTILINE),  # model info line
+    re.compile(r'MCP server.*connect\.', re.MULTILINE),  # MCP loading msgs
+    re.compile(r'Experimental mode.*future\.', re.MULTILINE),  # experimental warning
+    re.compile(r'GitHub Copilot v[\d.]+'),  # version banner
+    re.compile(r'Describe a task to get started\.'),  # welcome text
+    re.compile(r'Tip:.*\n?'),  # tip lines
+    re.compile(r'No copilot instructions found\..*\n?'),  # instructions warning
+    re.compile(r'Copilot uses AI.*mistakes\.\s*'),  # disclaimer
+]
 
 
 def _clean_pty_output(text: str) -> str:
-    """Strip ANSI, control chars, and truncate to Telegram's message limit."""
-    # Remove ANSI escape sequences
+    """Strip ANSI, OSC, TUI chrome, control chars; truncate to Telegram limit."""
     text = ANSI_ESCAPE_RE.sub('', text)
-    # Remove other non-printable control characters (except newline/tab)
+    text = OSC_RE.sub('', text)
+    text = CSI_RE.sub('', text)
+    # Remove non-printable control characters (except newline/tab)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    # Collapse excessive blank lines
+    # Strip TUI chrome patterns
+    for pattern in _TUI_CHROME_PATTERNS:
+        text = pattern.sub('', text)
+    # Collapse excessive whitespace
     text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
     text = text.strip()
     if len(text) > _TG_MAX_CHARS:
         text = text[:_TG_MAX_CHARS] + '\n…(truncated)'
@@ -89,8 +124,9 @@ class PtySession:
     def spawn(self) -> None:
         """Launch the Copilot CLI process in a ConPTY.
 
-        Sets the ``COPILOT_INSTRUCTIONS`` environment variable to
-        ``instructions_path`` when provided.
+        Sets the working directory to the per-chat directory (so Copilot
+        finds ``.github/copilot-instructions.md``) and waits for the CLI
+        to finish loading before marking the session as ready.
 
         Raises:
             RuntimeError: If the process is already running or the host OS is
@@ -116,19 +152,65 @@ class PtySession:
             raise RuntimeError("Could not find the copilot executable")
 
         env = dict(os.environ)
+
+        # Determine CWD: use per-chat directory if instructions exist there,
+        # so Copilot CLI picks up .github/copilot-instructions.md natively.
+        cwd: Optional[str] = None
         if self.instructions_path is not None and self.instructions_path.exists():
-            env["COPILOT_INSTRUCTIONS_FILE"] = str(self.instructions_path)
+            # instructions_path is e.g. ~/.copenclaw/chats/{id}/.github/copilot-instructions.md
+            # CWD should be the chat root (two levels up from .github/copilot-instructions.md)
+            chat_dir = self.instructions_path.parent.parent
+            cwd = str(chat_dir)
+            logger.info(f"[PTY] Using CWD={cwd} for chat_id={self.chat_id}")
 
         self._process = PtyProcess.spawn(
             [copilot_cmd],
             env=env,
+            cwd=cwd,
             dimensions=(50, 220),
         )
         logger.info(f"[PTY] Spawned session for chat_id={self.chat_id}, pid={self._process.pid}")
-        time.sleep(2)
+
+        # Start the reader thread FIRST so we can drain startup output
         self._start_reader_thread()
+
+        # Wait for Copilot CLI to finish loading (detect ready prompt)
+        self._wait_for_ready()
+
         self._start_monitor_thread()
         self.start_consumer()
+
+    def _wait_for_ready(self) -> None:
+        """Block until Copilot CLI has finished loading and shows its prompt.
+
+        Drains startup output from _read_queue looking for ready patterns.
+        Times out after READY_TIMEOUT_SEC and proceeds anyway.
+        """
+        deadline = time.monotonic() + READY_TIMEOUT_SEC
+        startup_buf = ""
+        while time.monotonic() < deadline:
+            try:
+                chunk = self._read_queue.get(timeout=1.0)
+            except stdlib_queue.Empty:
+                continue
+            if chunk is None:  # EOF
+                logger.warning(f"[PTY] EOF during startup wait for {self.chat_id}")
+                break
+            startup_buf += chunk
+            # Check for ready patterns in accumulated output
+            lower = startup_buf.lower()
+            for pattern in _READY_PATTERNS:
+                if pattern.lower() in lower:
+                    logger.info(f"[PTY] Ready detected for chat_id={self.chat_id} (matched '{pattern}')")
+                    # Drain any remaining queued startup output quickly
+                    time.sleep(0.5)
+                    while not self._read_queue.empty():
+                        try:
+                            self._read_queue.get_nowait()
+                        except stdlib_queue.Empty:
+                            break
+                    return
+        logger.warning(f"[PTY] Ready timeout for chat_id={self.chat_id} after {READY_TIMEOUT_SEC}s")
 
     def _start_reader_thread(self) -> None:
         """Start a background thread that continuously drains the PTY into _read_queue."""
