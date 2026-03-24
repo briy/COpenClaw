@@ -120,6 +120,25 @@ def handle_chat(
             return ChatResponse(text="🔄 Restarting COpenClaw… The app will be back online shortly.")
         return ChatResponse(text="Restart not available — no restart callback configured.")
 
+    if text.startswith("/reset"):
+        # Clear the Copilot CLI session so the next message starts fresh
+        # (no --resume).  Unlike /restart this does NOT reboot the app —
+        # it just discards the accumulated conversation context.
+        if req.sender_id not in allow_from:
+            return ChatResponse(text="Not authorized", status="denied")
+        session_key = f"{req.channel}:{req.channel_type or 'dm'}:{req.sender_id}"
+        old_sid = sessions.get_copilot_session_id(session_key)
+        sessions.clear_copilot_session_id(session_key)
+        if cli:
+            cli.resume_session_id = None
+        log_event(data_dir, f"{req.channel}.reset", {
+            "sender_id": req.sender_id,
+            "cleared_session": old_sid,
+        }, request_id=rid)
+        return ChatResponse(
+            text="🧹 Session context cleared. Next message starts a fresh Copilot session."
+        )
+
     if text.startswith("/update"):
         if req.sender_id not in allow_from and not (owner_id and req.sender_id == owner_id):
             return ChatResponse(text="Not authorized", status="denied")
@@ -542,7 +561,8 @@ def _cmd_help() -> ChatResponse:
         "`/update` — Check for code updates\n"
         "`/update apply` — Apply available update\n"
         "`/repair` — Run self-repair diagnostics\n"
-        "`/restart [reason]` — Restart the app\n\n"
+        "`/restart [reason]` — Restart the app\n"
+        "`/reset` — Clear session context (fresh conversation)\n\n"
         "Anything else is sent to the AI brain as free text."
     )
     return ChatResponse(text=help_text)
