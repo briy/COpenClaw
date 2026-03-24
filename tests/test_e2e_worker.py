@@ -834,6 +834,7 @@ class TestE2ETaskFlow:
         assert mirrored[-1][0] == "telegram"
         assert "Task 'notify-test'" in mirrored[-1][2]
 
+    @patch("copenclaw.mcp.protocol.TelegramAdapter")
     def test_approve_requires_token(self, mock_telegram, tmp_path):
         """Direct tasks_approve without proposal approval token should fail."""
         data_dir = str(tmp_path / "data")

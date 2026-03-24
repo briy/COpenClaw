@@ -207,7 +207,7 @@ TASK_TOOLS = [
     },
     {
         "name": "tasks_approve",
-        "description": "Approve a proposed task, spawning the worker (and optionally supervisor). Called automatically when the user replies 'Yes' to a proposal.",
+        "description": "Approve a proposed task, spawning the worker (and optionally supervisor). Called automatically when the user replies 'Yes' to a proposal. DO NOT call this tool directly — it requires an _approval_token that is only generated through the user confirmation flow. The orchestrator brain should NEVER invoke this tool; approval happens via the chat router when the user replies Yes.",
         "inputSchema": {
             "type": "object",
             "properties": {
