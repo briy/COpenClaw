@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -521,16 +522,50 @@ class CopilotCli:
     ) -> str:
         self._log_cli_runtime_metadata(log_prefix)
         cmd = self._base_cmd(resume_id=resume_id, autopilot=autopilot)
-        cmd.extend(["-p", prompt])
+        # On Windows, CreateProcessW enforces a hard 8 191-character limit
+        # on the entire command-line string.  When the prompt is short
+        # enough we pass it inline via `-p` (simplest, most reliable).
+        # When it would push the command line over ~7 000 chars we write
+        # the prompt to a temp file and pass `-p` with a short file-read
+        # instruction so Copilot CLI still enters prompt-mode and exits
+        # cleanly after responding.
+        #
+        # We do NOT use bare stdin piping (no `-p`) because Copilot CLI
+        # requires `-p` to enter non-interactive prompt-mode; without it
+        # the process enters the TUI and never exits.
+        #
+        # Ref: Windows CreateProcessW limit
+        #   https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
+        _CMDLINE_HEADROOM = 7000  # conservative; leaves room for base cmd + flags
+        prompt_file: Optional[str] = None
+        base_cmd_len = sum(len(a) + 3 for a in cmd)  # rough: arg + quotes + space
+        if base_cmd_len + len(prompt) + 10 > _CMDLINE_HEADROOM:
+            # Prompt is too long for the command line — spill to temp file.
+            prompt_file = os.path.join(
+                tempfile.gettempdir(),
+                f"copenclaw-prompt-{os.getpid()}-{id(prompt):x}.txt",
+            )
+            with open(prompt_file, "w", encoding="utf-8") as pf:
+                pf.write(prompt)
+            # Tell the model to read from the file.  The `-p` value is
+            # kept short so the command line stays well under the limit.
+            cmd.extend(["-p", f"Read and respond to the user prompt in: {prompt_file}"])
+            logger.info(
+                "%s | Prompt too long for cmdline (%d chars); spilled to %s",
+                log_prefix, len(prompt), prompt_file,
+            )
+        else:
+            cmd.extend(["-p", prompt])
         if model:
             cmd.extend(["--model", model])
 
         effective_cwd = cwd or self.workspace_dir
         logger.info(
-            "%s | Launching Copilot CLI (cwd=%s, resume=%s, cmd=%s)",
+            "%s | Launching Copilot CLI (cwd=%s, resume=%s, prompt_len=%d, cmd=%s)",
             log_prefix,
             effective_cwd,
             bool(resume_id or self._resume_session_id),
+            len(prompt),
             self._sanitize_cmd_for_log(cmd),
         )
         try:
@@ -609,6 +644,12 @@ class CopilotCli:
         finally:
             if timeout_timer:
                 timeout_timer.cancel()
+            # Clean up temp prompt file if we spilled to disk
+            if prompt_file:
+                try:
+                    os.unlink(prompt_file)
+                except OSError:
+                    pass
 
         output = "".join(output_lines).strip()
         if timed_out:
