@@ -482,6 +482,15 @@ def handle_chat(
     if not output.strip() and had_resume:
         output = _retry_without_resume("resume returned an empty response")
 
+    # Detect CAPIError 400 tool_use/tool_result corruption in the output.
+    # Copilot CLI exits 0 and returns the error as text instead of raising,
+    # so the exception-based retry above doesn't catch it.  When we see this
+    # pattern the session history is irrecoverably corrupted — clear it and
+    # retry on a fresh session so the user gets an actual response.
+    if had_resume and "CAPIError: 400" in output and "tool_use" in output and "tool_result" in output:
+        logger.warning("Detected CAPIError 400 tool_use corruption in output; auto-resetting session")
+        output = _retry_without_resume("CAPIError 400 tool_use/tool_result corruption")
+
     def _report_runtime_error(description: str) -> bool:
         if not on_runtime_error:
             return False
