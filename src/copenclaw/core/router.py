@@ -54,6 +54,7 @@ class ChatRequest:
     text: str
     service_url: Optional[str] = None  # Teams only
     request_id: Optional[str] = None
+    channel_type: Optional[str] = None  # "dm" | "group" etc.; defaults to "dm" in session key
 
 @dataclass
 class ChatResponse:
