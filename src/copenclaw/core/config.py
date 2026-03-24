@@ -11,6 +11,7 @@ class Settings:
     data_dir: str
     workspace_dir: str | None
     copilot_cli_timeout: int
+    orchestrator_cli_timeout: int
     task_watchdog_interval: int
     task_watchdog_grace_seconds: int
     task_watchdog_idle_warn_seconds: int
@@ -64,6 +65,7 @@ class Settings:
             data_dir=os.getenv("copenclaw_DATA_DIR") or default_data_dir,
             workspace_dir=os.getenv("copenclaw_WORKSPACE_DIR") or default_workspace,
             copilot_cli_timeout=int(os.getenv("copenclaw_CLI_TIMEOUT", "7200")),
+            orchestrator_cli_timeout=int(os.getenv("COPENCLAW_ORCHESTRATOR_CLI_TIMEOUT", "300")),
             task_watchdog_interval=int(os.getenv("copenclaw_TASK_WATCHDOG_INTERVAL", "60")),
             task_watchdog_grace_seconds=int(os.getenv("copenclaw_TASK_WATCHDOG_GRACE_SECONDS", "600")),
             task_watchdog_idle_warn_seconds=int(os.getenv("copenclaw_TASK_WATCHDOG_IDLE_WARN_SECONDS", "1800")),

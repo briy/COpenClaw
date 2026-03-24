@@ -673,7 +673,7 @@ def create_app() -> FastAPI:
 
     cli = CopilotCli(
         workspace_dir=settings.workspace_dir,
-        timeout=settings.copilot_cli_timeout,
+        timeout=settings.orchestrator_cli_timeout,
         mcp_server_url=mcp_server_url,
         mcp_token=settings.mcp_token or None,
     )
