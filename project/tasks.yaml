@@ -1,0 +1,156 @@
+tasks:
+  - id: "T-001"
+    title: "SQLite session store migration"
+    type: implementation
+    status: todo
+    priority: high
+    milestone: "M1"
+    owner: agent
+    depends_on: []
+    safe_for_agent: true
+    notes: "Replace JSON-file SessionStore with SQLite-backed implementation. Design schema for sessions, tasks, scheduled_jobs, audit_events tables. Write migration script for existing JSON data. See implementation-plan.md M1."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-002"
+    title: "SQLite task store migration"
+    type: implementation
+    status: todo
+    priority: high
+    milestone: "M1"
+    owner: agent
+    depends_on: ["T-001"]
+    safe_for_agent: true
+    notes: "Migrate TaskManager persistence from JSON files to SQLite. Include task_messages table for ITC history. Ensure atomic state transitions."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-003"
+    title: "SQLite scheduler and audit migration"
+    type: implementation
+    status: todo
+    priority: high
+    milestone: "M1"
+    owner: agent
+    depends_on: ["T-001"]
+    safe_for_agent: true
+    notes: "Migrate Scheduler and audit.py to SQLite backends. scheduled_jobs and audit_events tables. Maintain append-only semantics for audit."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-004"
+    title: "JSON-to-SQLite data migration script"
+    type: implementation
+    status: todo
+    priority: high
+    milestone: "M1"
+    owner: agent
+    depends_on: ["T-001", "T-002", "T-003"]
+    safe_for_agent: true
+    notes: "On first startup with SQLite, detect existing JSON files and import data. Run as part of gateway lifespan. Test with real production JSON data."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-005"
+    title: "Lossless context DAG data model"
+    type: planning
+    status: todo
+    priority: high
+    milestone: "M2"
+    owner: agent
+    depends_on: ["T-001"]
+    safe_for_agent: true
+    notes: "Design DAG data model for context nodes and summarization edges. Define SQLite schema. Determine summarization trigger thresholds (token count, turn count). Inspired by lossless-claw approach."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-006"
+    title: "Implement context summarization engine"
+    type: implementation
+    status: todo
+    priority: high
+    milestone: "M2"
+    owner: agent
+    depends_on: ["T-005"]
+    safe_for_agent: true
+    notes: "Build summarization engine that compresses older conversation turns using Copilot CLI. Store summaries as DAG nodes in SQLite. Support expansion back to original detail."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-007"
+    title: "Agent recall tools — session_search MCP tool"
+    type: implementation
+    status: todo
+    priority: medium
+    milestone: "M3"
+    owner: agent
+    depends_on: ["T-001", "T-006"]
+    safe_for_agent: true
+    notes: "Implement session_search MCP tool using SQLite FTS5. Full-text search across session history. Return session ID, timestamp, relevance score, and matching snippets."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-008"
+    title: "Agent recall tools — session_expand and task_history_search"
+    type: implementation
+    status: todo
+    priority: medium
+    milestone: "M3"
+    owner: agent
+    depends_on: ["T-007"]
+    safe_for_agent: true
+    notes: "Implement session_expand (retrieve full detail for summarized nodes) and task_history_search (search completed task reports/artifacts) MCP tools."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-009"
+    title: "Autonomous tech radar — source config and crawl pipeline"
+    type: implementation
+    status: todo
+    priority: medium
+    milestone: "M4"
+    owner: agent
+    depends_on: ["T-001"]
+    safe_for_agent: true
+    notes: "Define source list (OpenClaw, lossless-claw, Anthropic/OpenAI changelogs, Copilot CLI releases). Implement crawl pipeline with change detection. Status: stashed pending prioritization."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-010"
+    title: "Tech radar — scheduled execution and notification delivery"
+    type: implementation
+    status: todo
+    priority: medium
+    milestone: "M4"
+    owner: agent
+    depends_on: ["T-009"]
+    safe_for_agent: true
+    notes: "Create scheduled task template for radar. Implement summary generation and delivery to user's chat channel. Configurable cron schedule."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-011"
+    title: "Add CI/CD pipeline with GitHub Actions"
+    type: setup
+    status: todo
+    priority: medium
+    milestone: "M1"
+    owner: agent
+    depends_on: []
+    safe_for_agent: true
+    notes: "Set up GitHub Actions workflow for pytest on push/PR. Include linting (ruff or flake8). Ensure tests run on Windows and Linux."
+    created: "2026-03-25"
+    updated: "2026-03-25"
+
+  - id: "T-012"
+    title: "Improve test coverage for channel integrations"
+    type: validation
+    status: todo
+    priority: medium
+    milestone: "M1"
+    owner: agent
+    depends_on: []
+    safe_for_agent: true
+    notes: "Add unit tests for WhatsApp, Signal, and Slack adapters. Current tests cover Telegram and Teams. Target 80%+ coverage for integrations/."
+    created: "2026-03-25"
+    updated: "2026-03-25"
