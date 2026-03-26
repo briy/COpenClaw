@@ -43,6 +43,31 @@ from copenclaw.mcp.protocol import MCPProtocolHandler
 
 logger = logging.getLogger("copenclaw.gateway")
 
+# --------------- outbound dedup ---------------
+_DEDUP_MAX_PER_KEY = 5
+_DEDUP_TTL_SECONDS = 120
+_outbound_dedup_lock = threading.Lock()
+_outbound_dedup_cache: dict[str, list[tuple[float, str]]] = {}
+
+
+def _outbound_is_duplicate(channel: str, target: str, text: str) -> bool:
+    """Return True if this exact message was already sent to the same
+    channel+target within the dedup TTL window.  Thread-safe."""
+    key = f"{channel}:{target}"
+    digest = hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()
+    now = time.monotonic()
+    with _outbound_dedup_lock:
+        entries = _outbound_dedup_cache.get(key, [])
+        # Evict expired entries
+        entries = [(ts, h) for ts, h in entries if now - ts < _DEDUP_TTL_SECONDS]
+        if any(h == digest for _, h in entries):
+            logger.debug("Dedup: suppressing duplicate message to %s", key)
+            return True
+        entries.append((now, digest))
+        # Keep only the most recent N
+        _outbound_dedup_cache[key] = entries[-_DEDUP_MAX_PER_KEY:]
+    return False
+
 import platform
 import re
 import socket
@@ -1174,6 +1199,8 @@ def create_app() -> FastAPI:
         mcp_handler.decline_retry(task_id)
 
     def _send_repair_message(channel: str, target: str, text: str, service_url: str | None = None) -> None:
+        if _outbound_is_duplicate(channel, target, text):
+            return
         try:
             if channel == "telegram" and settings.telegram_bot_token:
                 _telegram_adapter().send_message(chat_id=int(target), text=text)
@@ -1445,7 +1472,12 @@ def create_app() -> FastAPI:
             return
         finally:
             typing_stop.set()
-        tg.send_message(chat_id=chat_id, text=resp.text)
+        try:
+            delivered = tg.send_message(chat_id=chat_id, text=resp.text)
+            if not delivered:
+                logger.warning("Telegram poll: partial/failed delivery to chat %s", chat_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Telegram poll send_message error: %s", exc)
         _mirror_activity("telegram", str(chat_id), f"➡️ bot: {resp.text}")
 
     # ---- lifespan ----
@@ -1638,7 +1670,12 @@ def create_app() -> FastAPI:
             return {"status": "error"}
         finally:
             typing_stop.set()
-        tg.send_message(chat_id=chat_id, text=resp.text)
+        try:
+            delivered = tg.send_message(chat_id=chat_id, text=resp.text)
+            if not delivered:
+                logger.warning("Telegram webhook: partial/failed delivery to chat %s", chat_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Telegram webhook send_message error: %s", exc)
         _mirror_activity("telegram", str(chat_id), f"➡️ bot: {resp.text}")
         return {"status": resp.status}
 
@@ -1905,21 +1942,33 @@ def create_app() -> FastAPI:
 
     # Wire completion hook: when a task completes, feed a completion prompt
     # (including any on_complete instruction) to the orchestrator CLI session.
+    # Retries once on timeout with a truncated prompt.
     def _on_complete_hook(prompt: str, channel: str, target: str, service_url: str, source_task_name: str) -> None:
+        def _deliver(output: str) -> None:
+            if not (output and channel and target):
+                return
+            if _outbound_is_duplicate(channel, target, output):
+                logger.info("on_complete dedup: suppressing duplicate for task '%s'", source_task_name)
+            elif channel == "telegram" and settings.telegram_bot_token:
+                _telegram_adapter().send_message(chat_id=int(target), text=output)
+            elif channel == "teams" and settings.msteams_app_id:
+                if service_url:
+                    _teams_adapter().send_message(
+                        service_url=service_url,
+                        conversation_id=target,
+                        text=output,
+                    )
+
         try:
-            logger.info("on_complete hook firing for task '%s'", source_task_name)
-            output = cli.run_prompt(prompt)
-            # Deliver the orchestrator's response to the user
-            if output and channel and target:
-                if channel == "telegram" and settings.telegram_bot_token:
-                    _telegram_adapter().send_message(chat_id=int(target), text=output)
-                elif channel == "teams" and settings.msteams_app_id:
-                    if service_url:
-                        _teams_adapter().send_message(
-                            service_url=service_url,
-                            conversation_id=target,
-                            text=output,
-                        )
+            logger.info("on_complete hook firing for task '%s' (prompt_len=%d)", source_task_name, len(prompt))
+            try:
+                output = cli.run_prompt(prompt)
+            except CopilotCliError:
+                # Retry once with truncated prompt (keeps first 4000 chars)
+                truncated = prompt[:4000] + "\n\n[Prompt truncated due to timeout — respond briefly.]"
+                logger.warning("on_complete hook timed out for task '%s'; retrying with truncated prompt", source_task_name)
+                output = cli.run_prompt(truncated)
+            _deliver(output)
             log_event(settings.data_dir, "task.on_complete_delivered", {
                 "source_task": source_task_name,
                 "output_len": len(output) if output else 0,
