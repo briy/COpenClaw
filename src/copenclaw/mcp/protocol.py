@@ -1855,6 +1855,9 @@ class MCPProtocolHandler:
         task_id = args["task_id"]
         report_type = args["type"]
         task_for_report = tm.get(task_id)
+        if not task_for_report:
+            logger.warning("Orphan worker report for missing task %s (type=%s) — ignoring", task_id, report_type)
+            return {"status": "task_gone", "task_id": task_id, "message": "Task no longer exists. Stop all work and exit."}
         is_continuous = bool(task_for_report and getattr(task_for_report, "task_type", "standard") == "continuous_improvement")
         from_tier = args.get("from_tier")
         if not from_tier:
@@ -2026,9 +2029,19 @@ class MCPProtocolHandler:
     def _tool_task_check_inbox(self, args: dict[str, Any]) -> dict:
         tm = self._require_task_manager()
         task_id = args["task_id"]
-        # If task is in a terminal state, tell the caller to exit
+        # If task doesn't exist, tell the orphan worker to exit
         task = tm.get(task_id)
-        if task and task.status in ("completed", "failed", "cancelled"):
+        if not task:
+            logger.warning("Orphan worker check_inbox for missing task %s — telling it to exit", task_id)
+            return {
+                "messages": [
+                    {"msg_id": "system", "type": "terminate", "from": "system",
+                     "content": "Task no longer exists. Stop all work and exit immediately."}
+                ],
+                "task_status": "gone",
+            }
+        # If task is in a terminal state, tell the caller to exit
+        if task.status in ("completed", "failed", "cancelled"):
             return {
                 "messages": [
                     {"msg_id": "system", "type": "terminate", "from": "system",
@@ -2048,14 +2061,16 @@ class MCPProtocolHandler:
         tm = self._require_task_manager()
         task = tm.update_status(args["task_id"], args["status"])
         if not task:
-            raise ValueError(f"Task not found: {args['task_id']}")
+            logger.warning("Orphan worker set_status for missing task %s — ignoring", args["task_id"])
+            return {"status": "task_gone", "task_id": args["task_id"], "message": "Task no longer exists. Stop all work and exit."}
         return {"status": task.status, "task_id": task.task_id}
 
     def _tool_task_get_context(self, args: dict[str, Any]) -> dict:
         tm = self._require_task_manager()
         task = tm.get(args["task_id"])
         if not task:
-            raise ValueError(f"Task not found: {args['task_id']}")
+            logger.warning("Orphan worker context request for missing task %s — ignoring", args["task_id"])
+            return {"status": "task_gone", "task_id": args["task_id"], "message": "Task no longer exists. Stop all work and exit."}
         # Return recent outbox messages as conversation context
         recent_msgs = task.outbox[-20:]
         return {
@@ -2077,9 +2092,8 @@ class MCPProtocolHandler:
         tail = args.get("tail", 200)
         task = tm.get(task_id)
         if not task:
-            raise ValueError(f"Task not found: {task_id}")
-
-        # ── Worker Status Block (gives supervisor full execution context) ──
+            logger.warning("Orphan supervisor peer-read for missing task %s — ignoring", task_id)
+            return {"status": "task_gone", "task_id": task_id, "message": "Task no longer exists. Stop all work and exit."}
         now = _now()
         process_state = self._sync_worker_process_state(tm, task_id)
         worker_running = bool(process_state.get("running"))
@@ -2203,7 +2217,8 @@ class MCPProtocolHandler:
         task_id = args["task_id"]
         task = tm.get(task_id)
         if not task:
-            raise ValueError(f"Task not found: {task_id}")
+            logger.warning("Orphan supervisor process_info for missing task %s — ignoring", task_id)
+            return {"status": "task_gone", "task_id": task_id, "message": "Task no longer exists. Stop all work and exit."}
 
         process_state = self._sync_worker_process_state(tm, task_id)
         root_pid = process_state.get("pid")
@@ -2260,7 +2275,8 @@ class MCPProtocolHandler:
             from_tier="supervisor",
         )
         if not msg:
-            raise ValueError(f"Task not found: {args['task_id']}")
+            logger.warning("Orphan supervisor send_input for missing task %s — ignoring", args["task_id"])
+            return {"status": "task_gone", "task_id": args["task_id"], "message": "Task no longer exists. Stop all work and exit."}
         task = tm.get(args["task_id"])
         worker_relaunched = False
         if task and task.status in {"running", "paused", "needs_input", "pending"} and self.worker_pool:
