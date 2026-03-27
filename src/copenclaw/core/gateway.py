@@ -469,6 +469,26 @@ def _read_readme(workspace_dir: str, max_chars: int = 8000) -> str:
         return ""
 
 
+def _sync_board_cache(workspace_dir: str) -> None:
+    """Run the board cache sync script to refresh the local SQLite copy."""
+    sync_script = os.path.join(workspace_dir, "foundry", "tools", "sync-board.py")
+    if not os.path.isfile(sync_script):
+        logger.debug("Board sync script not found at %s, skipping", sync_script)
+        return
+    try:
+        result = subprocess.run(
+            ["python", sync_script],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                logger.info("Board sync: %s", line)
+        else:
+            logger.warning("Board sync failed (exit %d): %s", result.returncode, result.stderr[:200])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Board sync error: %s", exc)
+
+
 def _resolve_repo_root() -> str:
     env_root = os.getenv("copenclaw_REPO_ROOT")
     if env_root:
@@ -1039,6 +1059,9 @@ def create_app() -> FastAPI:
         _seed_readme(workspace)
         readme_context = _read_readme(workspace)
 
+        # Sync Portfolio Board cache (lightweight SQLite copy for planning)
+        _sync_board_cache(workspace)
+
         try:
             logger.info("Bootstrapping Copilot CLI brain session...")
             response = cli.create_session(context=readme_context)
@@ -1046,8 +1069,11 @@ def create_app() -> FastAPI:
             # Discover the session ID that Copilot CLI just created and
             # store it so subsequent user messages resume this session
             # (preserving the boot context including README.md).
-            boot_sid = cli._discover_latest_non_task_session_id()
+            # Use owned_only=False for the very first boot discovery so we
+            # can find the session we just created (it has no marker yet).
+            boot_sid = cli._discover_latest_non_task_session_id(owned_only=False)
             if boot_sid:
+                cli.mark_session_owned(boot_sid)
                 cli._resume_session_id = boot_sid
                 cli._session_id = boot_sid
                 logger.info("Brain session ready. Captured boot session ID: %s", boot_sid)
