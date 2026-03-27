@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -450,6 +451,40 @@ def handle_chat(
 
     had_resume = bool(copilot_sid or cli.resume_session_id)
 
+    turn_start_time = time.monotonic()
+
+    # Pre-flight context budget check (pure Python — no LLM calls).
+    # If the session is over budget, rotate before sending.
+    rotation_handoff = ""
+    if copilot_sid:
+        from copenclaw.core.context_budget import ContextBudget
+        _budget = ContextBudget()
+        budget_status = _budget.check(copilot_sid)
+        if budget_status and budget_status.needs_rotation:
+            logger.warning("Pre-flight budget check: rotating session %s for %s (%.1f%%)",
+                           copilot_sid, session_key, budget_status.utilization_pct)
+            # Build deterministic handoff from recent message history
+            rotation_handoff = _build_handoff(sessions, session_key, budget_status)
+            sessions.clear_copilot_session_id(session_key)
+            cli.resume_session_id = None
+            copilot_sid = None
+            had_resume = False
+            log_event(data_dir, "session.rotated", {
+                "session_key": session_key,
+                "reason": "context_budget",
+                "utilization_pct": budget_status.utilization_pct,
+                "tokens": budget_status.current_tokens,
+            })
+
+    # If we rotated, prepend handoff context to the user's message
+    if rotation_handoff:
+        prompt_with_reminder = (
+            f"[SESSION CONTEXT — previous session was rotated due to context limits]\n"
+            f"{rotation_handoff}\n"
+            f"[END SESSION CONTEXT]\n\n"
+            f"{prompt_with_reminder}"
+        )
+
     def _retry_without_resume(reason: str) -> str:
         logger.warning("Copilot CLI %s for %s; retrying without resume", reason, session_key)
         if copilot_sid:
@@ -512,21 +547,126 @@ def handle_chat(
         _report_runtime_error(output)
 
     # After the prompt completes, discover the session ID so we can
-    # resume this conversation next time.  We always try to discover
-    # (not just on the first message) because the boot session's ID
-    # may have been used on the first call, and we need to capture
-    # the actual session that now contains the user's conversation.
-    discovered = cli._discover_latest_non_task_session_id()
-    if discovered and discovered != copilot_sid:
-        sessions.set_copilot_session_id(session_key, discovered)
-        logger.info("Stored Copilot CLI session %s for %s", discovered, session_key)
+    # resume this conversation next time.  Only discover when we don't
+    # already have a stored session — once we know our session ID, keep
+    # it.  This prevents a race where another CLI session (e.g. the
+    # user's terminal) becomes the newest by mtime and hijacks our
+    # conversation.
+    # Also re-discover after session rotation (_retry_without_resume
+    # clears the stored ID, so current_sid will be None).
+    current_sid = sessions.get_copilot_session_id(session_key)
+    if not current_sid:
+        discovered = cli._discover_latest_non_task_session_id(owned_only=False)
+        if discovered:
+            cli.mark_session_owned(discovered)
+            sessions.set_copilot_session_id(session_key, discovered)
+            logger.info("Stored Copilot CLI session %s for %s", discovered, session_key)
 
     # Still log messages for audit trail (but no longer used for prompt building)
     sessions.append_message(session_key, "user", text)
     sessions.append_message(session_key, "assistant", output)
 
+    # Harvest and log telemetry (pure Python, no LLM calls)
+    _log_turn_telemetry(cli, data_dir, session_key, "orchestrator", text, output, turn_start_time)
+
     _log_orchestrator(data_dir, req, output)
     return ChatResponse(text=output)
+
+
+# ── Session rotation helpers ──────────────────────────────────
+
+_HANDOFF_MAX_MESSAGES = 6  # Last N messages to include in handoff
+_HANDOFF_MAX_CHARS = 2000  # Max chars per message in handoff
+
+
+def _build_handoff(
+    sessions: SessionStore,
+    session_key: str,
+    budget_status: "BudgetStatus",
+) -> str:
+    """Build a deterministic handoff summary from recent chat history.
+
+    No LLM calls — just extracts the last few messages from the session
+    store and formats them as context for the new session.
+    """
+    from copenclaw.core.context_budget import BudgetStatus  # noqa: F811 — type import
+
+    messages = sessions.get_history(session_key)
+    if not messages:
+        return f"Previous session used {budget_status.utilization_pct:.0f}% of context window."
+
+    # Take last N messages, truncating long ones
+    recent = messages[-_HANDOFF_MAX_MESSAGES:]
+    lines = [
+        f"Previous session: {budget_status.utilization_pct:.0f}% context used "
+        f"({budget_status.current_tokens:,} tokens). Recent conversation:"
+    ]
+    for msg in recent:
+        role = msg.get("role", "?").upper()
+        text = msg.get("text", "")
+        if len(text) > _HANDOFF_MAX_CHARS:
+            text = text[:_HANDOFF_MAX_CHARS] + "... [truncated]"
+        lines.append(f"  {role}: {text}")
+
+    return "\n".join(lines)
+
+
+# ── Telemetry ─────────────────────────────────────────────────
+
+def _log_turn_telemetry(
+    cli: CopilotCli,
+    data_dir: str,
+    session_key: str,
+    role: str,
+    input_text: str,
+    output_text: str,
+    start_time: float,
+) -> None:
+    """Log structured per-turn telemetry to context-telemetry.jsonl.
+
+    Pure Python — no LLM calls.  Harvests token data from Copilot CLI's
+    session events and writes a single JSON line.
+    """
+    import json as _json
+
+    duration_ms = int((time.monotonic() - start_time) * 1000)
+
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "role": role,
+        "session_key": session_key,
+        "input_chars": len(input_text),
+        "output_chars": len(output_text),
+        "duration_ms": duration_ms,
+    }
+
+    # Harvest session metrics (fast path — reads tail of events.jsonl)
+    try:
+        metrics = cli.harvest_current_metrics()
+        if metrics:
+            record["session_id"] = metrics.session_id
+            record["model"] = metrics.model
+            record["current_tokens"] = metrics.current_tokens
+            record["conversation_tokens"] = metrics.conversation_tokens
+            record["overhead_tokens"] = metrics.overhead_tokens
+            record["context_utilization_pct"] = round(metrics.context_utilization_pct, 1)
+            record["total_output_tokens"] = metrics.total_output_tokens
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Telemetry harvest failed: %s", exc)
+
+    try:
+        telemetry_path = os.path.join(data_dir, "context-telemetry.jsonl")
+        with open(telemetry_path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(record) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to write context-telemetry.jsonl: %s", exc)
+
+    # Log a summary line for live monitoring
+    ctx_pct = record.get("context_utilization_pct", "?")
+    logger.info(
+        "TELEMETRY [%s] %s | %d→%d chars | %dms | context: %s%%",
+        role, session_key, len(input_text), len(output_text), duration_ms, ctx_pct,
+    )
 
 
 # ── Slash command implementations ─────────────────────────────

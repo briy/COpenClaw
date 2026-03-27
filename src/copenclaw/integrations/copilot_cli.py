@@ -464,8 +464,44 @@ class CopilotCli:
         summary = self._session_summary(session_dir)
         return summary.startswith("you are worker for task") or summary.startswith("you are supervisor for task")
 
-    def _discover_latest_non_task_session_id(self) -> Optional[str]:
-        """Discover latest session, excluding worker/supervisor task sessions."""
+    # ── Session ownership ────────────────────────────────────
+    _OWNERSHIP_MARKER = ".copenclaw-owned"
+
+    @staticmethod
+    def _session_dir_for_id(session_id: str) -> Optional[str]:
+        """Return the on-disk path for a Copilot CLI session, or None."""
+        config_dir = os.path.expanduser("~/.copilot")
+        for subdir in ("session-state", "sessions"):
+            candidate = os.path.join(config_dir, subdir, session_id)
+            if os.path.isdir(candidate):
+                return candidate
+        return None
+
+    def mark_session_owned(self, session_id: str) -> None:
+        """Write an ownership marker into a session dir so we can identify it later."""
+        session_dir = self._session_dir_for_id(session_id)
+        if not session_dir:
+            logger.debug("Cannot mark session %s — dir not found", session_id)
+            return
+        marker = os.path.join(session_dir, self._OWNERSHIP_MARKER)
+        try:
+            Path(marker).write_text("copenclaw\n", encoding="utf-8")
+            logger.info("Marked session %s as copenclaw-owned", session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to mark session %s: %s", session_id, exc)
+
+    @classmethod
+    def _is_owned_session(cls, session_dir: str) -> bool:
+        """Return True if the session dir contains our ownership marker."""
+        return os.path.isfile(os.path.join(session_dir, cls._OWNERSHIP_MARKER))
+
+    def _discover_latest_non_task_session_id(self, owned_only: bool = True) -> Optional[str]:
+        """Discover latest session, excluding worker/supervisor task sessions.
+
+        When *owned_only* is True (default), only sessions that COpenClaw
+        created (marked with the ownership marker) are considered.  This
+        prevents accidentally resuming a user's terminal CLI session.
+        """
         config_dir = os.path.expanduser("~/.copilot")
         sessions_dir = os.path.join(config_dir, "session-state")
         if not os.path.isdir(sessions_dir):
@@ -479,10 +515,12 @@ class CopilotCli:
                 reverse=True,
             )
             for entry in entries:
+                if owned_only and not self._is_owned_session(entry.path):
+                    continue
                 summary = self._session_summary(entry.path)
                 if summary.startswith("you are worker for task") or summary.startswith("you are supervisor for task"):
                     continue
-                logger.info("Discovered latest non-task Copilot CLI session: %s", entry.name)
+                logger.info("Discovered latest non-task Copilot CLI session: %s (owned_only=%s)", entry.name, owned_only)
                 return entry.name
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to discover non-task session ID: %s", exc)
@@ -777,6 +815,19 @@ class CopilotCli:
             autopilot=autopilot,
             on_line=on_line,
         )
+
+    def harvest_current_metrics(self) -> "Optional[SessionMetrics]":
+        """Harvest telemetry from the current session's events.jsonl.
+
+        Uses the fast path (reads only the tail of the file) for real-time
+        budget checks.  Returns None if no session ID is known.
+        """
+        from copenclaw.core.telemetry import harvest_session_metrics_fast
+
+        sid = self._session_id or self._resume_session_id
+        if not sid:
+            return None
+        return harvest_session_metrics_fast(sid)
 
     def version(self) -> str:
         """Return copilot CLI version string."""

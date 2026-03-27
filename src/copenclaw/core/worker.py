@@ -237,14 +237,22 @@ def _sync_workspace(source_dir: str, target_dir: str) -> None:
             logger.debug("Could not reverse-sync %s", entry)
 
 
+_MAX_INSTRUCTIONS_CHARS = 50_000
+
+
 def _write_instructions_file(working_dir: str, content: str) -> str:
     """Write .github/copilot-instructions.md into the working directory."""
+    if len(content) > _MAX_INSTRUCTIONS_CHARS:
+        raise ValueError(
+            f"Instructions too large ({len(content):,} chars, limit {_MAX_INSTRUCTIONS_CHARS:,}). "
+            "Reduce the task prompt or context size."
+        )
     github_dir = os.path.join(working_dir, ".github")
     os.makedirs(github_dir, exist_ok=True)
     instructions_path = os.path.join(github_dir, "copilot-instructions.md")
     with open(instructions_path, "w", encoding="utf-8") as f:
         f.write(content)
-    logger.info("Wrote instructions file: %s", instructions_path)
+    logger.info("Wrote instructions file: %s (%d chars)", instructions_path, len(content))
     return instructions_path
 
 
@@ -388,6 +396,55 @@ class WorkerThread:
         _log_to_file(self.worker_log_path, line)
         _log_to_file(self._central_worker_log, line)
         _log_to_file(_activity_log_path(), f"[{tag}] {line}")
+
+    def _log_worker_telemetry(self, cli: "CopilotCli", output: str) -> None:
+        """Log structured telemetry for this worker turn.  Pure Python."""
+        try:
+            from copenclaw.core.telemetry import harvest_session_metrics_fast
+            from copenclaw.core.context_budget import ContextBudget
+
+            sid = self._session_id
+            if not sid:
+                return
+
+            metrics = harvest_session_metrics_fast(sid)
+            if not metrics:
+                return
+
+            # Check budget (pure arithmetic)
+            budget = ContextBudget()
+            budget_status = budget.check(sid)
+
+            record = {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "role": "worker",
+                "task_id": self.task_id,
+                "session_id": sid,
+                "model": metrics.model,
+                "current_tokens": metrics.current_tokens,
+                "conversation_tokens": metrics.conversation_tokens,
+                "overhead_tokens": metrics.overhead_tokens,
+                "context_utilization_pct": round(metrics.context_utilization_pct, 1),
+                "output_chars": len(output),
+                "budget_warning": budget_status.warning if budget_status else False,
+                "budget_needs_rotation": budget_status.needs_rotation if budget_status else False,
+            }
+
+            data_dir = os.path.dirname(os.path.dirname(self.worker_log_path))
+            telemetry_path = os.path.join(data_dir, "context-telemetry.jsonl")
+            with open(telemetry_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+
+            self._log(
+                f"TELEMETRY | context: {record['context_utilization_pct']}% "
+                f"| tokens: {metrics.current_tokens} "
+                f"| conversation: {metrics.conversation_tokens} "
+                f"| overhead: {metrics.overhead_tokens}"
+                + (" | ⚠️ BUDGET WARNING" if record.get("budget_warning") else "")
+                + (" | 🔴 ROTATION NEEDED" if record.get("budget_needs_rotation") else "")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Worker telemetry harvest failed for %s: %s", self.task_id, exc)
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -591,6 +648,9 @@ class WorkerThread:
             if discovered:
                 self._session_id = discovered
                 self._log(f"Captured worker session: {discovered}")
+
+            # Harvest and log worker telemetry (pure Python, no LLM calls)
+            self._log_worker_telemetry(cli, final_output)
 
             # Final sync before completing
             if self.root_workspace_dir:

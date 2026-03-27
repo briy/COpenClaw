@@ -1611,10 +1611,11 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/control/metrics")
-    def control_metrics() -> dict[str, int]:
+    def control_metrics() -> dict:
         jobs = scheduler.list()
         all_tasks = task_manager.list_tasks()
-        return {
+
+        base_metrics = {
             "total_jobs": len(jobs),
             "pending_jobs": len([j for j in jobs if j.completed_at is None and not j.cancelled]),
             "completed_jobs": len([j for j in jobs if j.completed_at is not None and not j.cancelled]),
@@ -1627,6 +1628,61 @@ def create_app() -> FastAPI:
             "tasks_failed": len([t for t in all_tasks if t.status == "failed"]),
             "workers_active": worker_pool.active_count(),
         }
+
+        # Harvest brain session telemetry (pure Python — no LLM calls)
+        try:
+            brain_metrics = cli.harvest_current_metrics()
+            if brain_metrics:
+                base_metrics["brain_session"] = {
+                    "session_id": brain_metrics.session_id,
+                    "model": brain_metrics.model,
+                    "current_tokens": brain_metrics.current_tokens,
+                    "conversation_tokens": brain_metrics.conversation_tokens,
+                    "system_tokens": brain_metrics.system_tokens,
+                    "tool_definition_tokens": brain_metrics.tool_definition_tokens,
+                    "overhead_tokens": brain_metrics.overhead_tokens,
+                    "context_utilization_pct": round(brain_metrics.context_utilization_pct, 1),
+                    "total_turns": brain_metrics.total_turns,
+                    "total_output_tokens": brain_metrics.total_output_tokens,
+                    "total_api_duration_ms": brain_metrics.total_api_duration_ms,
+                }
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Read recent context telemetry stats
+        try:
+            telemetry_path = os.path.join(settings.data_dir, "context-telemetry.jsonl")
+            if os.path.isfile(telemetry_path):
+                import json as _json
+                lines = []
+                with open(telemetry_path, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if raw:
+                            try:
+                                lines.append(_json.loads(raw))
+                            except _json.JSONDecodeError:
+                                pass
+                if lines:
+                    orch_turns = [l for l in lines if l.get("role") == "orchestrator"]
+                    worker_turns = [l for l in lines if l.get("role") == "worker"]
+                    base_metrics["telemetry"] = {
+                        "orchestrator_turns_total": len(orch_turns),
+                        "worker_turns_total": len(worker_turns),
+                        "orchestrator_avg_duration_ms": (
+                            int(sum(t.get("duration_ms", 0) for t in orch_turns) / len(orch_turns))
+                            if orch_turns else 0
+                        ),
+                        "worker_avg_duration_ms": (
+                            int(sum(t.get("duration_ms", 0) for t in worker_turns) / len(worker_turns))
+                            if worker_turns else 0
+                        ),
+                        "latest_context_utilization_pct": lines[-1].get("context_utilization_pct", 0),
+                    }
+        except Exception:  # noqa: BLE001
+            pass
+
+        return base_metrics
 
     @app.post("/agent", response_model=AgentResponse)
     def agent(req: AgentRequest) -> AgentResponse:

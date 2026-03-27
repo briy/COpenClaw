@@ -77,23 +77,48 @@ class TelegramAdapter:
         t.start()
         return stop_event
 
-    def send_message(self, chat_id: int, text: str) -> None:
+    def send_message(self, chat_id: int, text: str) -> bool:
+        """Send a message to Telegram. Returns True if all chunks delivered."""
         if not text:
             text = "(empty response)"
         url = f"{self._base_url()}/sendMessage"
         max_len = max(1, _MAX_TEXT_LENGTH - _CHUNK_MARGIN)
         chunks = _split_text(text, max_len)
+        all_ok = True
         with httpx.Client(timeout=15.0) as client:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 payload = {"chat_id": chat_id, "text": chunk}
-                resp = client.post(url, json=payload)
-                if resp.status_code != 200:
+                success = False
+                last_err = ""
+                for attempt in range(3):  # up to 2 retries
+                    try:
+                        resp = client.post(url, json=payload)
+                        if resp.status_code != 200:
+                            last_err = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                        else:
+                            # Check Telegram's own ok field
+                            try:
+                                body = resp.json()
+                                if not body.get("ok", True):
+                                    last_err = f"Telegram ok=false: {body.get('description', '')}"
+                                else:
+                                    success = True
+                                    break
+                            except Exception:
+                                success = True  # HTTP 200 but non-JSON — treat as ok
+                                break
+                    except (httpx.TimeoutException, httpx.ConnectError, OSError) as exc:
+                        last_err = f"{type(exc).__name__}: {exc}"
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s backoff
+                if not success:
                     logger.error(
-                        "Telegram sendMessage failed: %s %s",
-                        resp.status_code,
-                        resp.text[:500],
+                        "Telegram sendMessage failed after 3 attempts (chunk %d/%d): %s",
+                        i + 1, len(chunks), last_err,
                     )
-                    return  # Don't raise — callers handle gracefully
+                    all_ok = False
+                    # Continue to next chunk instead of dropping the rest
+        return all_ok
 
     def send_photo(self, chat_id: int, photo_path: str, caption: str | None = None) -> None:
         if not os.path.isfile(photo_path):
@@ -185,10 +210,14 @@ class TelegramAdapter:
 
         def _poll_loop() -> None:
             offset = 0
+            consecutive_errors = 0
             logger.info("Telegram polling started")
             while not self._stop_event.is_set():
                 try:
                     updates = self.get_updates(offset=offset, timeout=25)
+                    if consecutive_errors > 0:
+                        logger.info("Telegram polling recovered after %d consecutive error(s)", consecutive_errors)
+                        consecutive_errors = 0
                     for update in updates:
                         update_id = update.get("update_id", 0)
                         offset = update_id + 1
@@ -197,8 +226,10 @@ class TelegramAdapter:
                         except Exception as exc:  # noqa: BLE001
                             logger.error("Error processing Telegram update %s: %s", update_id, exc)
                 except Exception as exc:  # noqa: BLE001
-                    logger.error("Telegram polling error: %s", exc)
-                    time.sleep(5)  # back off on errors
+                    consecutive_errors += 1
+                    backoff = min(5 * (2 ** (consecutive_errors - 1)), 60)  # 5s, 10s, 20s, 40s, 60s cap
+                    logger.error("Telegram polling error (attempt %d, backoff %ds): %s", consecutive_errors, backoff, exc)
+                    time.sleep(backoff)
 
         self._polling_thread = threading.Thread(target=_poll_loop, daemon=True, name="telegram-poller")
         self._polling_thread.start()
