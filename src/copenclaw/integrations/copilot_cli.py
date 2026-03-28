@@ -30,6 +30,33 @@ _UNKNOWN_OPTION_BURST_LIMIT = 3
 _MIN_NO_WARNINGS_FIXED_VERSION = (0, 0, 410)
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants (best-effort).
+
+    On Windows uses taskkill /T (tree kill).  On Unix walks /proc or
+    uses os.killpg.  Falls back to killing just the root PID.
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            # Try killing the process group first
+            try:
+                os.killpg(os.getpgid(pid), 9)
+            except (OSError, ProcessLookupError):
+                os.kill(pid, 9)
+    except Exception:  # noqa: BLE001
+        # Last resort — kill just the root
+        try:
+            os.kill(pid, 9)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _env_get(*names: str) -> Optional[str]:
     for name in names:
         value = os.getenv(name)
@@ -181,6 +208,7 @@ class CopilotCli:
         self._initialized = False
         self._version_logged = False
         self._cached_version: Optional[str] = None
+        self._last_discovered_session_id: Optional[str] = None
 
     @property
     def session_id(self) -> Optional[str]:
@@ -495,18 +523,68 @@ class CopilotCli:
         """Return True if the session dir contains our ownership marker."""
         return os.path.isfile(os.path.join(session_dir, cls._OWNERSHIP_MARKER))
 
-    def _discover_latest_non_task_session_id(self, owned_only: bool = True) -> Optional[str]:
-        """Discover latest session, excluding worker/supervisor task sessions.
-
-        When *owned_only* is True (default), only sessions that COpenClaw
-        created (marked with the ownership marker) are considered.  This
-        prevents accidentally resuming a user's terminal CLI session.
-        """
+    @staticmethod
+    def _sessions_dir() -> Optional[str]:
+        """Return the path to the Copilot CLI sessions directory, or None."""
         config_dir = os.path.expanduser("~/.copilot")
-        sessions_dir = os.path.join(config_dir, "session-state")
-        if not os.path.isdir(sessions_dir):
-            sessions_dir = os.path.join(config_dir, "sessions")
-        if not os.path.isdir(sessions_dir):
+        for subdir in ("session-state", "sessions"):
+            candidate = os.path.join(config_dir, subdir)
+            if os.path.isdir(candidate):
+                return candidate
+        return None
+
+    def snapshot_session_dirs(self) -> set[str]:
+        """Return the current set of session directory names.
+
+        Call this *before* launching a CLI process.  After the process
+        completes, call :meth:`discover_new_session` with this snapshot
+        to identify the session the process created.
+        """
+        sessions_dir = self._sessions_dir()
+        if not sessions_dir:
+            return set()
+        try:
+            return {e.name for e in os.scandir(sessions_dir) if e.is_dir()}
+        except OSError:
+            return set()
+
+    def discover_new_session(self, before_snapshot: set[str]) -> Optional[str]:
+        """Find a session created since *before_snapshot* was taken.
+
+        Compares the current session directories against the snapshot and
+        returns the newest NEW directory (one that didn't exist before).
+        This is immune to mtime races with the user's terminal sessions.
+        If no new session is found, falls back to the newest owned session.
+        """
+        sessions_dir = self._sessions_dir()
+        if not sessions_dir:
+            return None
+        try:
+            current = {
+                e.name: e.stat().st_mtime
+                for e in os.scandir(sessions_dir)
+                if e.is_dir()
+            }
+        except OSError:
+            return None
+
+        new_ids = set(current.keys()) - before_snapshot
+        if new_ids:
+            # Pick the newest of the new sessions (usually just one)
+            best = max(new_ids, key=lambda sid: current[sid])
+            logger.info("Discovered NEW session (snapshot diff): %s", best)
+            self.mark_session_owned(best)
+            return best
+
+        # Fallback: no new directory found (e.g. CLI reused an existing
+        # session).  Fall back to newest owned, non-task session.
+        logger.debug("No new session dirs found; falling back to newest owned session")
+        return self._discover_latest_owned_session()
+
+    def _discover_latest_owned_session(self) -> Optional[str]:
+        """Discover the newest COpenClaw-owned, non-task session."""
+        sessions_dir = self._sessions_dir()
+        if not sessions_dir:
             return None
         try:
             entries = sorted(
@@ -515,15 +593,15 @@ class CopilotCli:
                 reverse=True,
             )
             for entry in entries:
-                if owned_only and not self._is_owned_session(entry.path):
+                if not self._is_owned_session(entry.path):
                     continue
                 summary = self._session_summary(entry.path)
                 if summary.startswith("you are worker for task") or summary.startswith("you are supervisor for task"):
                     continue
-                logger.info("Discovered latest non-task Copilot CLI session: %s (owned_only=%s)", entry.name, owned_only)
+                logger.info("Discovered latest owned session: %s", entry.name)
                 return entry.name
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to discover non-task session ID: %s", exc)
+            logger.debug("Failed to discover owned session: %s", exc)
         return None
 
     # ── public API ────────────────────────────────────────────
@@ -598,6 +676,12 @@ class CopilotCli:
             cmd.extend(["--model", model])
 
         effective_cwd = cwd or self.workspace_dir
+
+        # Snapshot session dirs BEFORE launching so we can detect the new
+        # session created by this CLI invocation (immune to mtime races).
+        is_new_session = not (resume_id or self._resume_session_id)
+        pre_launch_snapshot = self.snapshot_session_dirs() if is_new_session else set()
+
         logger.info(
             "%s | Launching Copilot CLI (cwd=%s, resume=%s, prompt_len=%d, cmd=%s)",
             log_prefix,
@@ -632,11 +716,15 @@ class CopilotCli:
             def _on_timeout() -> None:
                 nonlocal timed_out
                 timed_out = True
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
+                logger.warning("%s | Timeout after %ds — killing process tree", log_prefix, self.timeout)
+                _kill_process_tree(process.pid)
+                # Close stdout to unblock the read loop — process.kill()
+                # alone doesn't help if child processes hold the pipe open.
+                try:
+                    if process.stdout and not process.stdout.closed:
+                        process.stdout.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
             timeout_timer = threading.Timer(self.timeout, _on_timeout)
             timeout_timer.daemon = True
@@ -644,6 +732,8 @@ class CopilotCli:
         try:
             assert process.stdout is not None
             for line in process.stdout:
+                if timed_out:
+                    break
                 output_lines.append(line)
                 self._log_line(line, prefix=log_prefix)
                 clean_line = line.rstrip("\n\r")
@@ -666,6 +756,9 @@ class CopilotCli:
                         logger.info("%s | Early stop requested; terminating Copilot CLI process", log_prefix)
                         process.terminate()
                         break
+        except ValueError:
+            # stdout was closed by the timeout handler — expected
+            pass
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -742,6 +835,17 @@ class CopilotCli:
 
         logger.info("%s → complete (%d chars)", log_prefix, len(output))
         self._initialized = True
+
+        # If this was a new session (no --resume), discover which session
+        # was created by comparing against the pre-launch snapshot.
+        if is_new_session and pre_launch_snapshot:
+            new_sid = self.discover_new_session(pre_launch_snapshot)
+            if new_sid:
+                self._resume_session_id = new_sid
+                self._session_id = new_sid
+                self._last_discovered_session_id = new_sid
+                logger.info("%s | Captured new session ID via snapshot: %s", log_prefix, new_sid)
+
         return output
 
     def create_session(self, context: str = "", allow_retry: bool = True) -> str:

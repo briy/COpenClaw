@@ -1066,14 +1066,10 @@ def create_app() -> FastAPI:
             logger.info("Bootstrapping Copilot CLI brain session...")
             response = cli.create_session(context=readme_context)
 
-            # Discover the session ID that Copilot CLI just created and
-            # store it so subsequent user messages resume this session
-            # (preserving the boot context including README.md).
-            # Use owned_only=False for the very first boot discovery so we
-            # can find the session we just created (it has no marker yet).
-            boot_sid = cli._discover_latest_non_task_session_id(owned_only=False)
+            # The CLI adapter captures the new session ID automatically
+            # via directory snapshot during create_session().
+            boot_sid = cli._last_discovered_session_id
             if boot_sid:
-                cli.mark_session_owned(boot_sid)
                 cli._resume_session_id = boot_sid
                 cli._session_id = boot_sid
                 logger.info("Brain session ready. Captured boot session ID: %s", boot_sid)

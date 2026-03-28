@@ -643,8 +643,9 @@ class WorkerThread:
 
             self._log(f"Process exited (code={exit_code}, output_lines={len(self._accumulated_output)})")
 
-            # Discover and store session ID for potential future resume
-            discovered = cli._discover_latest_session_id()
+            # Discover and store session ID for potential future resume.
+            # The CLI adapter captures this via directory snapshot automatically.
+            discovered = cli._last_discovered_session_id
             if discovered:
                 self._session_id = discovered
                 self._log(f"Captured worker session: {discovered}")
@@ -962,8 +963,9 @@ class SupervisorThread:
                     autopilot=False,
                 )
 
-                # Always re-discover session ID (may change between checks)
-                discovered = cli._discover_latest_session_id()
+                # Always re-discover session ID (may change between checks).
+                # The CLI adapter captures this via directory snapshot automatically.
+                discovered = cli._last_discovered_session_id
                 if discovered and discovered != self._session_id:
                     self._session_id = discovered
                     self._log(f"Captured supervisor session: {discovered}")

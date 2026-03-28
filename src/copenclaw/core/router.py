@@ -546,21 +546,13 @@ def handle_chat(
     elif output.lower().startswith("error:"):
         _report_runtime_error(output)
 
-    # After the prompt completes, discover the session ID so we can
-    # resume this conversation next time.  Only discover when we don't
-    # already have a stored session — once we know our session ID, keep
-    # it.  This prevents a race where another CLI session (e.g. the
-    # user's terminal) becomes the newest by mtime and hijacks our
-    # conversation.
-    # Also re-discover after session rotation (_retry_without_resume
-    # clears the stored ID, so current_sid will be None).
+    # After the prompt completes, persist the session ID so we can
+    # resume this conversation next time.  The CLI adapter captures the
+    # session ID automatically via directory snapshot (no mtime race).
     current_sid = sessions.get_copilot_session_id(session_key)
-    if not current_sid:
-        discovered = cli._discover_latest_non_task_session_id(owned_only=False)
-        if discovered:
-            cli.mark_session_owned(discovered)
-            sessions.set_copilot_session_id(session_key, discovered)
-            logger.info("Stored Copilot CLI session %s for %s", discovered, session_key)
+    if not current_sid and cli._last_discovered_session_id:
+        sessions.set_copilot_session_id(session_key, cli._last_discovered_session_id)
+        logger.info("Stored Copilot CLI session %s for %s", cli._last_discovered_session_id, session_key)
 
     # Still log messages for audit trail (but no longer used for prompt building)
     sessions.append_message(session_key, "user", text)
