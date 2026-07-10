@@ -624,6 +624,30 @@ class CopilotCli:
             f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {error_text}",
         )
 
+    @staticmethod
+    def _prompt_needs_spill(
+        prompt: str,
+        base_cmd_len: int,
+        headroom: int = 7000,
+    ) -> bool:
+        """Decide whether to spill the prompt to a temp file instead of ``-p``.
+
+        Two cases require spilling:
+
+        1. **Length** — a prompt long enough to push the command line over the
+           Windows CreateProcessW limit (~8 191 chars).
+
+        2. **Multi-line** — any prompt containing a newline.  On Windows the
+           Copilot CLI is launched via a ``.cmd``/``.bat`` shim (or ``.ps1``
+           through PowerShell), and the batch/PowerShell arg parser truncates
+           a multi-line ``-p`` value at the first newline.  This silently
+           dropped everything after line 1 of scheduled-task prompts.  Reading
+           the prompt from a file preserves the full multi-line content.
+        """
+        if "\n" in prompt or "\r" in prompt:
+            return True
+        return base_cmd_len + len(prompt) + 10 > headroom
+
     def _run_prompt_cli(
         self,
         prompt: str,
@@ -640,11 +664,15 @@ class CopilotCli:
         cmd = self._base_cmd(resume_id=resume_id, autopilot=autopilot)
         # On Windows, CreateProcessW enforces a hard 8 191-character limit
         # on the entire command-line string.  When the prompt is short
-        # enough we pass it inline via `-p` (simplest, most reliable).
-        # When it would push the command line over ~7 000 chars we write
-        # the prompt to a temp file and pass `-p` with a short file-read
-        # instruction so Copilot CLI still enters prompt-mode and exits
-        # cleanly after responding.
+        # (and single-line) we pass it inline via `-p` (simplest, most
+        # reliable).  When it would push the command line over ~7 000 chars
+        # OR contains a newline we write the prompt to a temp file and pass
+        # `-p` with a short file-read instruction so Copilot CLI still enters
+        # prompt-mode and exits cleanly after responding.
+        #
+        # Multi-line prompts MUST be spilled: the Windows `.cmd`/`.bat`/`.ps1`
+        # launcher truncates a multi-line `-p` argument at the first newline,
+        # which silently dropped everything after line 1 of scheduled prompts.
         #
         # We do NOT use bare stdin piping (no `-p`) because Copilot CLI
         # requires `-p` to enter non-interactive prompt-mode; without it
@@ -655,8 +683,8 @@ class CopilotCli:
         _CMDLINE_HEADROOM = 7000  # conservative; leaves room for base cmd + flags
         prompt_file: Optional[str] = None
         base_cmd_len = sum(len(a) + 3 for a in cmd)  # rough: arg + quotes + space
-        if base_cmd_len + len(prompt) + 10 > _CMDLINE_HEADROOM:
-            # Prompt is too long for the command line — spill to temp file.
+        if self._prompt_needs_spill(prompt, base_cmd_len, _CMDLINE_HEADROOM):
+            # Prompt is too long or multi-line for the command line — spill to temp file.
             prompt_file = os.path.join(
                 tempfile.gettempdir(),
                 f"copenclaw-prompt-{os.getpid()}-{id(prompt):x}.txt",
@@ -667,8 +695,8 @@ class CopilotCli:
             # kept short so the command line stays well under the limit.
             cmd.extend(["-p", f"Read and respond to the user prompt in: {prompt_file}"])
             logger.info(
-                "%s | Prompt too long for cmdline (%d chars); spilled to %s",
-                log_prefix, len(prompt), prompt_file,
+                "%s | Prompt spilled to file (%d chars, multiline=%s); path=%s",
+                log_prefix, len(prompt), "\n" in prompt or "\r" in prompt, prompt_file,
             )
         else:
             cmd.extend(["-p", prompt])
@@ -781,6 +809,21 @@ class CopilotCli:
                     os.unlink(prompt_file)
                 except OSError:
                     pass
+
+        # Ensure returncode is populated — without wait(), it stays None
+        # even after stdout is fully consumed.
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            logger.warning("%s | Process did not exit after stdout closed; killing", log_prefix)
+            try:
+                _kill_process_tree(process.pid)
+            except (AttributeError, OSError):
+                process.kill()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
 
         output = "".join(output_lines).strip()
         if timed_out:
